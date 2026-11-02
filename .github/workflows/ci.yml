@@ -45,3 +45,24 @@ jobs:
       - run: cargo test -p fpb-bridgestan -- --ignored
         env:
           FPB_BRIDGESTAN_MODELS: ${{ github.workspace }}/target/bridgestan-models
+
+  python:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: python
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: prefix-dev/setup-pixi@v0.9.3
+        with:
+          manifest-path: python/pyproject.toml
+          environments: test
+          locked: false
+          cache: false
+      - run: pixi run -e test test

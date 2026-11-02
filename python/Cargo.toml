@@ -1,0 +1,22 @@
+[package]
+name = "flatppl-bridge-python"
+description = "Python bindings of flatppl-bridge: serve Python callables as FlatPPL black boxes."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+name = "_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+flatppl-bridge = { path = "../crates/core" }
+arrow-array.workspace = true
+arrow-buffer.workspace = true
+arrow-schema.workspace = true
+axum.workspace = true
+pyo3 = { version = "0.30.1", features = ["abi3-py310"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "sync"] }
