@@ -19,7 +19,7 @@ All paths are under the prefix `/v1`. A server that changes this protocol incomp
 | Method and path | Purpose |
 |---|---|
 | `GET /v1/boxes` | List the boxes, one name per line (`text/plain`). |
-| `GET /v1/boxes/{box}/describe` | Describe the members of a box (FlatPPL text). |
+| `GET /v1/boxes/{box}/describe` | Describe the members of a box (JSON). |
 | `POST /v1/query` | Evaluate a query (multipart). |
 | `HEAD /v1/objects/sha256/{hex}` | Check whether the store holds an object: 200 or 404. |
 | `PUT /v1/objects/sha256/{hex}` | Upload an object: 201, or 200 if the store holds it already. |
@@ -36,7 +36,12 @@ A FlatPPL value maps to one element of an Arrow array:
 | integer | `Int64` (a request may also use any other integer type) |
 | boolean | `Boolean` |
 | array of shape `[d1, ..., dk]` | `k` nested `FixedSizeList`s, outermost of size `d1`, row-major |
+| array of arrays | the outer array's `FixedSizeList`s around the element arrays |
 | record | `Struct`, one child per field, in field order |
+
+An array of `n` vectors of length `d` and an `n` by `d` matrix have the same Arrow type. They are different values (spec §03: vectors of vectors are not matrices), and the value set tells them apart: `cartpow(cartpow(reals, d), n)` and `cartpow(reals, [n, d])`.
+
+A data part may use `List` or `LargeList` wherever this table has `FixedSizeList`, if every list has the size that the value set gives.
 
 The protocol does not require 64-bit floats. A box answers in the precision it computes. A client converts if it needs another precision.
 
@@ -47,6 +52,7 @@ A data part holds one value as an Arrow IPC stream. The layout follows `load_dat
 - A scalar: one column, one row.
 - A record: one row, one column per field.
 - An array of shape `[n, d2, ..., dk]` of scalars: one column with `n` rows. Each row holds the sub-array of shape `[d2, ..., dk]`, or a scalar if `k = 1`.
+- An array of `n` arrays: one column with `n` rows. Each row holds one element array.
 - A table of `n` rows: one column per table column, `n` rows.
 
 A single-column part may give its column any name. A part may split its rows over several record batches. A reply part carries the schema metadata key `flatppl.valueset`, whose value is the value set of the part as FlatPPL text, for example `cartpow(reals, [100, 3])`.
@@ -91,7 +97,7 @@ An argument is a binding name, a literal, or a record literal of these. `M` is a
 
 A measure member is a nullary kernel (spec §06). FlatPPL has no empty-record literal, so a measure member takes no `input` argument. The server resolves the arity from the member kind.
 
-`broadcast` follows spec §04. `callee` is a function member, or one of `builtin_logdensityof` and the four transports. Array arguments are iterated elementwise, tables row-wise, and members and scalars are held constant. Size-one axes expand. `builtin_sample` is not batched in version 1, because a shared RNG state would correlate the rows.
+`broadcast` follows spec §04. `callee` is a function member, or one of `builtin_logdensityof` and the four transports. Array arguments are iterated elementwise, tables row-wise, and members and scalars are held constant. Size-one axes expand. An element of an array is its entry, so a matrix broadcasts to scalars, and an array of vectors broadcasts one vector per row. For example, `broadcast(builtin_logdensityof, B.M, thetas)` with `thetas` in `cartpow(cartpow(reals, 2), 100)` gives 100 log densities, and with `thetas` in `cartpow(reals, [100, 2])` it gives 200. `builtin_sample` is not batched in version 1, because a shared RNG state would correlate the rows.
 
 A table is accepted only as a `broadcast` operand in version 1.
 
@@ -158,29 +164,29 @@ An unknown path also returns 404, without a `missing` field.
 
 ## Describe
 
-`GET /v1/boxes/{box}/describe` returns `text/x-flatppl`. The text binds each member name to a record:
+`GET /v1/boxes/{box}/describe` returns `application/json`. The JSON object maps each member name to a member object:
 
-```flatppl
-posterior = record(kind = "measure", queries = ["builtin_logdensityof"], gradient = true, vjp = false, variate = cartpow(reals, 2), normalized = false)
-f = record(kind = "function", queries = ["apply"], gradient = true, vjp = true, input = cartpow(reals, 3), output = reals)
-K = record(kind = "kernel", queries = ["builtin_logdensityof", "builtin_sample"], gradient = false, vjp = false, input = cartprod(mu = reals, sigma = posreals), variate = reals, normalized = true)
+```json
+{
+  "posterior": {"kind": "measure", "queries": ["builtin_logdensityof"], "gradient": true, "vjp": false, "variate": "cartpow(reals, 2)", "normalized": false},
+  "f": {"kind": "function", "queries": ["apply"], "gradient": true, "vjp": true, "input": "cartpow(reals, 3)", "output": "reals"},
+  "K": {"kind": "kernel", "queries": ["builtin_logdensityof", "builtin_sample"], "gradient": false, "vjp": false, "input": "cartprod(mu = reals, sigma = posreals)", "variate": "reals", "normalized": true}
+}
 ```
 
-| Field | Members | Meaning |
-|---|---|---|
-| `kind` | all | `"function"`, `"kernel"` or `"measure"`. |
-| `queries` | all | The supported query forms: `"apply"`, `"builtin_logdensityof"`, `"builtin_sample"`, and the transport names. |
-| `gradient`, `vjp` | all | Whether the deterministic queries support this derivative. |
-| `input` | functions, kernels | The value set of the input. |
-| `output` | functions | The value set of the output. |
-| `variate` | kernels, measures | The value set of the variate. |
-| `normalized` | kernels, measures | `true` if every measure has total mass 1. |
+| Key | Members | JSON type | Meaning |
+|---|---|---|---|
+| `kind` | all | string | `"function"`, `"kernel"` or `"measure"`. |
+| `queries` | all | array of strings | The supported query forms: `"apply"`, `"builtin_logdensityof"`, `"builtin_sample"`, and the transport names. |
+| `gradient`, `vjp` | all | boolean | Whether the deterministic queries support this derivative. |
+| `input` | functions, kernels | string | The value set of the input. |
+| `output` | functions | string | The value set of the output. |
+| `variate` | kernels, measures | string | The value set of the variate. |
+| `normalized` | kernels, measures | boolean | `true` if every measure has total mass 1. |
 
-A value set may be `anything`. `builtin_sample` is listed only for a normalized member, because only a probability measure can be sampled.
+A value set is a FlatPPL set expression (spec §03) in a JSON string, for example `"cartpow(reals, 10)"`. The server parses and checks each one with the FlatPPL parser. A value set may be `"anything"`. `builtin_sample` is listed only for a normalized member, because only a probability measure can be sampled.
 
 A function or kernel takes one input. An input with a record set takes keyword arguments, as in `B.f(a = x, b = y)` (spec §04 calling convention).
-
-The describe text is a description, not a model. Its records hold strings and value sets, which FlatPPL values cannot hold. The client parses it with the FlatPPL parser.
 
 ## Store
 
