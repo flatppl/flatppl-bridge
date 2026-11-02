@@ -54,14 +54,21 @@ class Reply:
     def json(self):
         return json.loads(self.body)
 
-    def parts(self) -> dict:
+    def _raw(self) -> dict:
         assert self.status == 200, self.body
         message = email.parser.BytesParser(policy=email.policy.HTTP).parsebytes(
             b"Content-Type: " + self.content_type.encode() + b"\r\n\r\n" + self.body
         )
+        return {p.get_param("name", header="content-disposition"): p.get_payload(decode=True) for p in message.iter_parts()}
+
+    def parts(self) -> dict:
+        return {name: decode(data) for name, data in self._raw().items()}
+
+    def valuesets(self) -> dict:
+        """The ``flatppl.valueset`` metadata of each part."""
         return {
-            p.get_param("name", header="content-disposition"): decode(p.get_payload(decode=True))
-            for p in message.iter_parts()
+            name: pa.ipc.open_stream(data).schema.metadata[b"flatppl.valueset"].decode()
+            for name, data in self._raw().items()
         }
 
 

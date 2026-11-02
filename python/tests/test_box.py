@@ -59,6 +59,7 @@ def _normal_box(calls: list | None = None) -> fb.Box:
 
     box.function("picky", picky)
     box.function("broken", lambda x: 1 / 0)
+    box.function("pair", lambda x: np.stack([x, 2 * x], axis=-1), input="reals", output="cartpow(reals, 2)")
     return box
 
 
@@ -258,3 +259,24 @@ def test_the_server_checks_inputs_before_the_callable():
         reply = query(s.url, text)
         assert reply.status == 400
         assert "posreals" in reply.json()["detail"]
+
+
+def test_a_broadcast_of_vector_results_is_an_array_of_vectors(server):
+    reply = query(server.url, HEAD + "result = py.pair.([1.0, 2.0, 3.0])\n")
+    assert reply.valuesets()["value"] == "cartpow(cartpow(reals, 2), 3)"
+    np.testing.assert_array_equal(reply.parts()["value"], [[1.0, 2.0], [2.0, 4.0], [3.0, 6.0]])
+    reply = query(server.url, HEAD + "result = py.pair(1.0)\n")
+    assert reply.valuesets()["value"] == "cartpow(reals, 2)"
+
+
+def test_batched_sampling_of_a_vector_kernel_gives_one_vector_per_row(server):
+    mus = np.array([[0.0, 1.0], [10.0, 20.0], [-5.0, 5.0]])
+    head = HEAD + 'mus = load_data("part:mus", cartpow(cartpow(reals, 2), 3))\n'
+    reply = query(server.url, head + "result = broadcast(builtin_sample, rnginit.([1, 2, 3]), py.shifted, mus)\n", {"mus": mus})
+    assert reply.valuesets()["value"] == "cartpow(cartpow(reals, 2), 3)"
+    value = reply.parts()["value"]
+    for row in range(3):
+        np.testing.assert_array_equal(value[row], mus[row] + _numpy_rng(row + 1).standard_normal(2))
+    reply = query(server.url, head + "result = broadcast(builtin_sample, rnginit.([1, 2, 3]), py.shifted, mus, 4)\n", {"mus": mus})
+    assert reply.valuesets()["value"] == "cartpow(cartpow(cartpow(reals, 2), 4), 3)"
+    assert reply.parts()["value"].shape == (3, 4, 2)
