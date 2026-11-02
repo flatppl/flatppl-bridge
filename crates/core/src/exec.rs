@@ -163,14 +163,9 @@ pub fn execute(
         let batched;
         (rng, batched) = rng_of(query, values, &result.args[0])?;
         match (result.broadcast, batched) {
-            (true, false) => {
-                return Err(unsupported(
-                    "a shared RNG state would correlate the rows: give `broadcast(builtin_sample, ...)` one RNG state per row",
-                ));
-            }
             (false, true) => return Err(bad("an array of RNG states needs `broadcast`")),
             (true, true) => rng_rows = Some(rng.len()),
-            (false, false) => {}
+            _ => {}
         }
         for size in rest {
             let n = match resolve(values, size)? {
@@ -235,6 +230,10 @@ pub fn execute(
         let point = whole(Slot::Point, point)?;
         (1, Vec::new(), input, point)
     };
+    // Fan-out splits a state that rows share (spec §07).
+    if result.op == Op::Sample && !batch.is_empty() && rng.len() != rows {
+        rng = split(&rng[0], rows);
+    }
 
     let derivative = match &options.derivative {
         None => None,
@@ -568,11 +567,39 @@ fn rng_of(
     }
 }
 
+/// Domain tag of [`split`]; a change of the derivation needs a new tag.
+const SPLIT_TAG: &[u8] = b"flatppl-blackbox/rng-split/v1";
+
+/// Split one RNG state into `n` row states (protocol: RNG state). Child `i` is
+/// the seed `SHA-256(tag, kind, len(parent), parent, n, i)`, integers as u64
+/// little-endian, kind 1 for a seed and 2 for a state. The box only defines
+/// `rnginit`, so the split works for every RNG algorithm. Like a JAX split,
+/// child `i` depends on `n`, so splits of one state at two widths do not alias.
+fn split(parent: &Rng, n: usize) -> Vec<Rng> {
+    use sha2::{Digest, Sha256};
+    let (kind, bytes) = match parent {
+        Rng::Seed(b) => (1u8, b),
+        Rng::State(b) => (2u8, b),
+    };
+    (0..n)
+        .map(|i| {
+            let mut h = Sha256::new();
+            h.update(SPLIT_TAG);
+            h.update([kind]);
+            h.update((bytes.len() as u64).to_le_bytes());
+            h.update(bytes);
+            h.update((n as u64).to_le_bytes());
+            h.update((i as u64).to_le_bytes());
+            Rng::Seed(h.finalize().to_vec())
+        })
+        .collect()
+}
+
 type Batched = (usize, Vec<usize>, Option<ArrayRef>, Option<ArrayRef>);
 
 /// Iterate collection operands elementwise (spec §04) and gather each row.
 /// `rngs` is the number of RNG states of a batched sample. They count as a
-/// collection, but never expand: a state shared by rows would correlate them.
+/// collection.
 fn broadcast(
     values: &HashMap<String, Value>,
     input: Option<SlotArg>,
@@ -663,13 +690,6 @@ fn broadcast(
                 *b = 0;
             }
         }
-    }
-    if let Some(shape) = &rng_shape
-        && batch != *shape
-    {
-        return Err(unsupported(
-            "a shared RNG state would correlate the rows: give `broadcast(builtin_sample, ...)` one RNG state per row",
-        ));
     }
     let rows: usize = batch.iter().product();
     let mut gathered: HashMap<(u8, Option<String>), ArrayRef> = HashMap::new();

@@ -661,25 +661,103 @@ fn batched_sampling_equals_unbatched_draws_per_row() {
     }
 }
 
+/// The documented split of protocol "RNG state", computed here from its text.
+fn split_seed(kind: u8, parent: &[u8], n: u64, i: u64) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"flatppl-blackbox/rng-split/v1");
+    h.update([kind]);
+    h.update((parent.len() as u64).to_le_bytes());
+    h.update(parent);
+    h.update(n.to_le_bytes());
+    h.update(i.to_le_bytes());
+    let bytes: Vec<i64> = h.finalize().iter().map(|&b| i64::from(b)).collect();
+    literal(&bytes)
+}
+
 #[test]
-fn batched_sampling_refuses_a_shared_rng_state() {
+fn batched_sampling_splits_a_shared_rng_state() {
     let server = start(None);
-    let t = table(vec![0.0, 1.0, 2.0], vec![1.0, 1.0, 1.0]);
-    let status = |q: &str| {
+    let t = table(vec![0.0, 10.0, -5.0], vec![1.0, 0.1, 2.0]);
+    let rows = [(0.0, 1.0), (10.0, 0.1), (-5.0, 2.0)];
+    let query = |q: &str, parts: &[(&str, Vec<u8>)]| {
         let q = format!(
             "{HEAD}t = load_data(\"part:t\", cartpow(cartprod(mu = reals, sigma = posreals), 3))\n{q}"
         );
-        server.query(&q, None, &[("t", t.clone())]).status
+        let mut all = vec![("t", t.clone())];
+        all.extend(parts.iter().cloned());
+        server.query(&q, None, &all)
     };
-    assert_eq!(
-        status("result = broadcast(builtin_sample, rnginit(1), tb.normal, t)\n"),
-        422
+    let single = |rng: &str, mu: f64, sigma: f64| {
+        server.query(
+            &format!(
+                "{HEAD}result = builtin_sample({rng}, tb.normal, (mu = {mu:?}, sigma = {sigma:?}), 4)\n"
+            ),
+            None,
+            &[],
+        )
+    };
+    // Row `i` equals the unbatched draw from the seed that the split derives.
+    let check = |batched: &Reply, kind: u8, parent: &[u8]| {
+        assert_eq!(batched.valueset("value"), "cartpow(cartpow(reals, 4), 3)");
+        let value = batched.reals("value");
+        let states = batched.int_rows("rngstate");
+        assert_eq!(states.len(), 3);
+        for (i, &(mu, sigma)) in rows.iter().enumerate() {
+            let one = single(
+                &format!("rnginit({})", split_seed(kind, parent, 3, i as u64)),
+                mu,
+                sigma,
+            );
+            assert_eq!(one.reals("value"), value[i * 4..][..4]);
+            assert_eq!(one.int_rows("rngstate")[0], states[i]);
+        }
+        assert_ne!(value[..4], value[4..8]);
+    };
+
+    let seed = 7u64.to_le_bytes();
+    let shared = query(
+        "result = broadcast(builtin_sample, rnginit(7), tb.normal, t, 4)\n",
+        &[],
     );
-    // A size-one array of states would expand to every row.
-    assert_eq!(
-        status("result = broadcast(builtin_sample, rnginit.([1]), tb.normal, t)\n"),
-        422
+    check(&shared, 1, &seed);
+    // A size-one array of states expands to the same shared state.
+    let one = query(
+        "result = broadcast(builtin_sample, rnginit.([7]), tb.normal, t, 4)\n",
+        &[],
     );
+    assert_eq!(one.reals("value"), shared.reals("value"));
+    assert_eq!(one.int_rows("rngstate"), shared.int_rows("rngstate"));
+
+    // A resumed state splits by its bytes.
+    let state: Vec<u8> = shared.int_rows("rngstate")[0]
+        .iter()
+        .map(|&b| b as u8)
+        .collect();
+    let resumed = query(
+        &format!(
+            "result = broadcast(builtin_sample, rngstate({}), tb.normal, t, 4)\n",
+            literal(&shared.int_rows("rngstate")[0])
+        ),
+        &[],
+    );
+    check(&resumed, 2, &state);
+
+    // With no collection there is one row and no fan-out.
+    let plain = server.query(
+        &format!("{HEAD}result = builtin_sample(rnginit(7), tb.stdnormal, 3)\n"),
+        None,
+        &[],
+    );
+    let broadcast = server.query(
+        &format!("{HEAD}result = broadcast(builtin_sample, rnginit(7), tb.stdnormal, 3)\n"),
+        None,
+        &[],
+    );
+    assert_eq!(broadcast.status, 200);
+    assert_eq!(broadcast.reals("value"), plain.reals("value"));
+
+    let status = |q: &str| query(q, &[]).status;
     assert_eq!(
         status("result = broadcast(builtin_sample, rnginit.([1, 2]), tb.normal, t)\n"),
         400
@@ -687,10 +765,6 @@ fn batched_sampling_refuses_a_shared_rng_state() {
     assert_eq!(
         status("result = builtin_sample(rnginit.([1, 2]), tb.stdnormal)\n"),
         400
-    );
-    assert_eq!(
-        status("result = broadcast(builtin_sample, rnginit.([1, 2, 3]), tb.normal, t)\n"),
-        200
     );
 }
 
