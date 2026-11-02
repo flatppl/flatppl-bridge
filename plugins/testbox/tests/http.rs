@@ -343,13 +343,25 @@ fn broadcast_table_of_inputs_with_shared_scalar() {
     let q = format!(
         "{HEAD}t = load_data(\"part:t\", cartpow(cartprod(mu = reals, sigma = posreals), 3))\nx = 0.3\nresult = broadcast(builtin_logdensityof, tb.normal, t, x)\n"
     );
-    let options = r#"{"derivative": {"kind": "gradient", "wrt": ["x"]}}"#;
+    let options = r#"{"derivative": {"kind": "gradient", "wrt": ["t", "x"]}}"#;
     let r = server.query(&q, Some(options), &[("t", table)]);
     let value = r.reals("value");
     assert!(close(value[0], LOG_N) && close(value[1], LOG_N));
     assert!(close(value[2], -0.9639385332046727));
     // The gradient of the sum: the shared x collects every row.
     assert!(close(r.reals("d_x")[0], 0.3 + 0.3 - 0.3));
+    // A table binding gets a table of per-column derivatives, one row per table row.
+    let d_t = r.part("d_t");
+    let column = |name: &str| {
+        d_t.column_by_name(name)
+            .unwrap()
+            .as_primitive::<Float64Type>()
+            .values()
+            .to_vec()
+    };
+    let (d_mu, d_sigma) = (column("mu"), column("sigma"));
+    assert!(close(d_mu[0], -0.3) && close(d_mu[1], -0.3) && close(d_mu[2], 0.3));
+    assert!(close(d_sigma[0], -0.32) && close(d_sigma[1], -0.32) && close(d_sigma[2], -0.91));
 }
 
 #[test]

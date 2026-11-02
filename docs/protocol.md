@@ -126,7 +126,7 @@ result = builtin_logdensityof(bb.K, theta, x)
 {"derivative": {"kind": "vjp", "wrt": ["theta"], "cotangent": "ct"}}
 ```
 
-- `wrt` lists data or literal binding names of the query. The server returns one derivative per name.
+- `wrt` lists data or literal binding names of the query. The server returns one derivative per name. The derivative of a table binding is a table with one column per table column.
 - `gradient` returns the gradient of the sum of all result entries. For a scalar result this is the ordinary gradient. For a broadcast it is the per-row gradient for a batched argument, and the sum over rows for a held-constant argument.
 - `vjp` returns the vector-Jacobian product with the cotangent. `cotangent` names a data binding of the query whose value has the shape of the result. For a result that is an array of arrays, the multi-axis array of the same entries is accepted too.
 - A derivative of `builtin_sample`, a derivative the member does not support, or a derivative with respect to an integer or boolean binding is refused with 422.

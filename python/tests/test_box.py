@@ -280,3 +280,30 @@ def test_batched_sampling_of_a_vector_kernel_gives_one_vector_per_row(server):
     reply = query(server.url, head + "result = broadcast(builtin_sample, rnginit.([1, 2, 3]), py.shifted, mus, 4)\n", {"mus": mus})
     assert reply.valuesets()["value"] == "cartpow(cartpow(cartpow(reals, 2), 4), 3)"
     assert reply.parts()["value"].shape == (3, 4, 2)
+
+
+def test_gradient_with_respect_to_a_table_of_kernel_inputs(server):
+    import pyarrow as pa
+
+    table = pa.table({"mu": [1.5, 1.5, 0.0], "sigma": [2.0, 2.0, 1.0]})
+    sink = pa.BufferOutputStream()
+    with pa.ipc.new_stream(sink, table.schema) as writer:
+        writer.write_table(table)
+    text = HEAD + (
+        'input = load_data("part:input", cartpow(cartprod(mu = reals, sigma = posreals), 3))\n'
+        'x = load_data("part:x", cartpow(reals, 3))\n'
+        "result = broadcast(builtin_logdensityof, py.normal, input, x)\n"
+    )
+    x = np.array([0.3, -1.0, 0.3])
+    parts = query(
+        server.url,
+        text,
+        {"input": sink.getvalue().to_pybytes(), "x": x},
+        {"derivative": {"kind": "gradient", "wrt": ["input", "x"]}},
+    ).parts()
+    mu, sigma = table["mu"].to_numpy(), table["sigma"].to_numpy()
+    np.testing.assert_allclose(parts["value"], stats.norm.logpdf(x, mu, sigma), rtol=1e-15)
+    # Closed-form derivatives of the normal log density.
+    np.testing.assert_allclose(parts["d_input"]["mu"], (x - mu) / sigma**2, rtol=1e-14)
+    np.testing.assert_allclose(parts["d_input"]["sigma"], ((x - mu) ** 2 / sigma**2 - 1) / sigma, rtol=1e-14)
+    np.testing.assert_allclose(parts["d_x"], -(x - mu) / sigma**2, rtol=1e-14)
