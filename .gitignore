@@ -1,5 +1,6 @@
 /target
-/.pixi
+.pixi/
+pixi.lock
 __pycache__/
 *.so
 *.dylib

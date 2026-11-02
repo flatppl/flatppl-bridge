@@ -16,6 +16,7 @@ The server core is Rust. Adapters are C ABI plugins, and a Python layer sits on 
 - `plugins/bridgestan`: a Stan model through BridgeStan.
 - `plugins/testbox`: closed-form test members.
 - `examples/c-plugin`: a minimal plugin in C.
+- `python`: the `flatppl_bridge` Python package, which serves Python callables as boxes. See `python/README.md`.
 
 ## Serve a Stan model
 
@@ -35,6 +36,7 @@ On macOS the plugin library ends in `.dylib`. `build-model.sh` uses BridgeStan a
 cargo test --workspace
 for m in plugins/bridgestan/tests/models/*.stan; do plugins/bridgestan/build-model.sh "$m" target/bridgestan-models; done
 FPB_BRIDGESTAN_MODELS=$PWD/target/bridgestan-models cargo test -p fpb-bridgestan -- --ignored
+(cd python && pixi run -e test test)
 ```
 
 Work in progress.

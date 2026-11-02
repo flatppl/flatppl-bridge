@@ -1,0 +1,57 @@
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "flatppl-bridge"
+version = "0.1.0"
+description = "Serve Python functions, densities and samplers as FlatPPL black boxes."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering",
+]
+
+[project.urls]
+Repository = "https://github.com/flatppl/flatppl-bridge"
+
+[tool.maturin]
+module-name = "flatppl_bridge._native"
+python-source = "."
+python-packages = ["flatppl_bridge"]
+features = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+platforms = ["osx-arm64", "linux-64", "linux-aarch64"]
+
+[tool.pixi.dependencies]
+python = "3.12.*"
+numpy = ">=1.24"
+maturin = ">=1.9,<2"
+pip = "*"
+
+[tool.pixi.feature.test.dependencies]
+pytest = "*"
+requests = "*"
+pyarrow = "*"
+scipy = "*"
+
+[tool.pixi.feature.test.pypi-dependencies]
+bridgestan = "*"
+
+[tool.pixi.environments]
+test = ["test"]
+
+[tool.pixi.tasks]
+develop = "maturin develop --release"
+
+[tool.pixi.feature.test.tasks]
+test = { cmd = "pytest -q", depends-on = ["develop"] }
