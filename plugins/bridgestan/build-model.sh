@@ -26,5 +26,6 @@ name=$(basename "$model" .stan)
 mkdir -p "$outdir"
 outdir=$(cd "$outdir" && pwd)
 cmp -s "$model" "$outdir/$name.stan" || cp "$model" "$outdir/$name.stan"
-make -s -C "$BRIDGESTAN" -j"${JOBS:-4}" "$outdir/${name}_model.so"
+# The server calls a model from several threads, which needs STAN_THREADS.
+make -s -C "$BRIDGESTAN" -j"${JOBS:-4}" STAN_THREADS=true "$outdir/${name}_model.so"
 echo "$outdir/${name}_model.so"

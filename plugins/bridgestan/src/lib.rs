@@ -16,6 +16,10 @@
 //!
 //! A Stan exception while evaluating the log density means zero density (Stan
 //! rejects the point), so the value is `-inf` and the gradient is `NaN`.
+//!
+//! The server calls a plugin from several threads. A model built without
+//! `STAN_THREADS` keeps one process-wide autodiff stack, so the plugin then
+//! runs one call at a time. `build-model.sh` builds with `STAN_THREADS=true`.
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::Float64Type;
@@ -29,6 +33,7 @@ type Construct = unsafe extern "C" fn(*const c_char, c_uint, *mut *mut c_char) -
 type Destruct = unsafe extern "C" fn(*mut c_void);
 type FreeError = unsafe extern "C" fn(*mut c_char);
 type UncNum = unsafe extern "C" fn(*const c_void) -> c_int;
+type ModelInfo = unsafe extern "C" fn(*const c_void) -> *const c_char;
 type ParamNum = unsafe extern "C" fn(*const c_void, bool, bool) -> c_int;
 type LogDensity = unsafe extern "C" fn(
     *const c_void,
@@ -72,11 +77,18 @@ pub struct BridgeStan {
     /// Unconstrained and constrained parameter counts.
     d: usize,
     m: usize,
+    /// Whether the model was built with `STAN_THREADS`.
+    threads: bool,
     // Never unloaded: Stan's TBB threads and static destructors outlive dlclose.
     _library: std::mem::ManuallyDrop<libloading::Library>,
 }
 
-// SAFETY: BridgeStan model methods are safe to call from several threads at once.
+/// Held around every call to a model without `STAN_THREADS`. Such models share
+/// one autodiff stack across the process, whatever library they come from.
+static UNTHREADED: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+// SAFETY: BridgeStan model methods are safe to call from several threads at once
+// with `STAN_THREADS`, and `call` serializes models without it.
 unsafe impl Send for BridgeStan {}
 // SAFETY: as above.
 unsafe impl Sync for BridgeStan {}
@@ -122,6 +134,7 @@ impl BridgeStan {
             let construct: Construct = get(&library, "bs_model_construct")?;
             let unc_num: UncNum = get(&library, "bs_param_unc_num")?;
             let param_num: ParamNum = get(&library, "bs_param_num")?;
+            let model_info: ModelInfo = get(&library, "bs_model_info")?;
             let api = Api {
                 destruct: get(&library, "bs_model_destruct")?,
                 free_error: get(&library, "bs_free_error_msg")?,
@@ -139,11 +152,13 @@ impl BridgeStan {
                 unc_num(model) as usize,
                 param_num(model, false, false) as usize,
             );
+            let info = CStr::from_ptr(model_info(model)).to_string_lossy();
             let plugin = BridgeStan {
                 api,
                 model,
                 d,
                 m,
+                threads: info.contains("STAN_THREADS=true"),
                 _library: std::mem::ManuallyDrop::new(library),
             };
             if d == 0 {
@@ -289,6 +304,7 @@ impl Plugin for BridgeStan {
     }
 
     fn call(&self, call: Call) -> Result<Output, Error> {
+        let _serial = (!self.threads).then(|| UNTHREADED.lock().unwrap_or_else(|e| e.into_inner()));
         match (call.member.as_str(), call.op) {
             ("posterior", Op::LogDensity) => self.log_density(&call),
             ("constrain", Op::Apply) if call.derivative.is_none() => self.constrain(&call),

@@ -37,7 +37,7 @@ jobs:
           path: |
             .bridgestan
             target/bridgestan-models
-          key: bridgestan-2.9.0-${{ matrix.os }}-${{ hashFiles('plugins/bridgestan/tests/models/*.stan') }}
+          key: bridgestan-2.9.0-threads-${{ matrix.os }}-${{ hashFiles('plugins/bridgestan/tests/models/*.stan', 'plugins/bridgestan/build-model.sh') }}
       - run: |
           for model in plugins/bridgestan/tests/models/*.stan; do
             plugins/bridgestan/build-model.sh "$model" target/bridgestan-models
