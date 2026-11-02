@@ -766,20 +766,8 @@ fn accumulate(
     rows: usize,
     real32: bool,
 ) -> Result<Value, BridgeError> {
-    let Value::Array { shape, data } = binding else {
-        return Err(unsupported(format!(
-            "a derivative w.r.t. `{name}` needs an array binding"
-        )));
-    };
-    // An array of arrays has its element arrays in `data`.
-    let (elem_dims, leaves) = flatten(data);
-    if !is_real(leaves.data_type()) {
-        return Err(unsupported(format!(
-            "`{name}` is not real, so it has no derivative"
-        )));
-    }
     let failure = |m: &str| BridgeError::Failure(format!("derivative w.r.t. `{name}`: {m}"));
-    let mut total = vec![0.0f64; leaves.len()];
+    let mut arrays = Vec::new();
     for occurrence in occurrences.iter().filter(|o| o.name == name) {
         let array = match occurrence.slot {
             Slot::Input => output.d_input.as_ref(),
@@ -797,7 +785,63 @@ fn accumulate(
         if array.len() != rows {
             return Err(failure("the box returned the wrong number of rows"));
         }
-        let (_, flat) = flatten(&array);
+        arrays.push((array, &occurrence.indices));
+    }
+    match binding {
+        Value::Array { shape, data } => {
+            let (dims, total) = sum_rows(name, data, &arrays, rows, &failure)?;
+            Ok(Value::Array {
+                shape: shape.clone(),
+                data: nest(reals(total, real32), &dims),
+            })
+        }
+        // A table's derivative is a table of per-column derivatives.
+        Value::Table(table) => {
+            let mut columns = Vec::new();
+            for (field, column) in table.fields().iter().zip(table.columns()) {
+                let column_arrays = arrays
+                    .iter()
+                    .map(|(array, indices)| {
+                        array
+                            .as_struct_opt()
+                            .and_then(|s| s.column_by_name(field.name()))
+                            .cloned()
+                            .map(|a| (a, *indices))
+                            .ok_or_else(|| failure("the box returned no column derivative"))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let label = format!("{name}.{}", field.name());
+                let (dims, total) = sum_rows(&label, column, &column_arrays, rows, &failure)?;
+                columns.push(nest(reals(total, real32), &dims));
+            }
+            let names = table.fields().iter().map(|f| f.name().as_str());
+            Ok(Value::Table(struct_array(names, columns, table.len())))
+        }
+        Value::Record(_) => Err(unsupported(format!(
+            "a derivative w.r.t. `{name}` needs an array or table binding"
+        ))),
+    }
+}
+
+/// Sum per-row derivatives into the elements of `data`, which each row took
+/// by `indices`. Returns the element dims and the flat sums.
+fn sum_rows(
+    name: &str,
+    data: &ArrayRef,
+    arrays: &[(ArrayRef, &Vec<usize>)],
+    rows: usize,
+    failure: &dyn Fn(&str) -> BridgeError,
+) -> Result<(Vec<usize>, Vec<f64>), BridgeError> {
+    // An array of arrays has its element arrays in `data`.
+    let (elem_dims, leaves) = flatten(data);
+    if !is_real(leaves.data_type()) {
+        return Err(unsupported(format!(
+            "`{name}` is not real, so it has no derivative"
+        )));
+    }
+    let mut total = vec![0.0f64; leaves.len()];
+    for (array, indices) in arrays {
+        let (_, flat) = flatten(array);
         let flat = arrow_cast::cast(&flat, &DataType::Float64).map_err(|_| failure("not real"))?;
         let flat = flat.as_primitive::<Float64Type>().values();
         let width = flat.len().checked_div(rows).unwrap_or(0);
@@ -805,7 +849,7 @@ fn accumulate(
         if rows > 0 && (width * rows != flat.len() || sources * width != total.len()) {
             return Err(failure("the box returned the wrong shape"));
         }
-        for (row, &source) in occurrence.indices.iter().enumerate() {
+        for (row, &source) in indices.iter().enumerate() {
             let (into, from) = (
                 &mut total[source * width..][..width],
                 &flat[row * width..][..width],
@@ -813,17 +857,17 @@ fn accumulate(
             into.iter_mut().zip(from).for_each(|(t, f)| *t += f);
         }
     }
-    let data: ArrayRef = if real32 {
+    Ok((elem_dims, total))
+}
+
+fn reals(total: Vec<f64>, real32: bool) -> ArrayRef {
+    if real32 {
         Arc::new(Float32Array::from(
             total.iter().map(|&x| x as f32).collect::<Vec<_>>(),
         ))
     } else {
         Arc::new(Float64Array::from(total))
-    };
-    Ok(Value::Array {
-        shape: shape.clone(),
-        data: nest(data, &elem_dims),
-    })
+    }
 }
 
 #[cfg(test)]
