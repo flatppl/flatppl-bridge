@@ -1,0 +1,24 @@
+[package]
+name = "fpb-bridgestan"
+description = "A flatppl-bridge plugin that serves a Stan model through BridgeStan."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+flatppl-bridge-abi = { path = "../../crates/abi" }
+arrow-array.workspace = true
+arrow-schema.workspace = true
+libloading.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+flatppl-bridge = { path = "../../crates/core" }
+arrow-array.workspace = true
+arrow-ipc.workspace = true
+libloading.workspace = true

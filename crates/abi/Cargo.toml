@@ -1,0 +1,13 @@
+[package]
+name = "flatppl-bridge-abi"
+description = "Rust mirror of the flatppl-bridge plugin C ABI (include/flatppl_bridge.h)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+arrow-array = { workspace = true, features = ["ffi"] }
+arrow-data = { workspace = true, features = ["ffi"] }
+arrow-schema = { workspace = true, features = ["ffi"] }

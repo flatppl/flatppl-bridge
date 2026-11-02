@@ -95,6 +95,8 @@ A measure member is a nullary kernel (spec §06). FlatPPL has no empty-record li
 
 A table is accepted only as a `broadcast` operand in version 1.
 
+The server checks data parts against their value sets. The box checks its inputs against its own value sets (see Describe).
+
 Version 1 refuses all other forms with 422. Examples are measure algebra on a member, a query on two boxes, and computation on data.
 
 Example:
