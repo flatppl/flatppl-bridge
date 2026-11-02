@@ -1,0 +1,16 @@
+[package]
+name = "flatppl-bridge-server"
+description = "The flatppl-bridge server: serves C ABI plugin boxes over HTTP."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+flatppl-bridge = { path = "../core" }
+axum.workspace = true
+axum-server = { version = "0.8.0", features = ["tls-rustls-no-provider"] }
+clap = { version = "4", features = ["derive", "env"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "macros"] }

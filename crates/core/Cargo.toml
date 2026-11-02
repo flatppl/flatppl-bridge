@@ -1,6 +1,6 @@
 [package]
 name = "flatppl-bridge"
-description = "Core of the FlatPPL black-box server: query checks, the content store and plugin dispatch."
+description = "Core of the FlatPPL black-box server: query checks, the content store, plugin dispatch and the HTTP binding."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,5 +8,21 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+flatppl-bridge-abi = { path = "../abi" }
 flatppl-core.workspace = true
 flatppl-syntax.workspace = true
+arrow-array.workspace = true
+arrow-cast.workspace = true
+arrow-ipc.workspace = true
+arrow-schema.workspace = true
+arrow-select.workspace = true
+axum = { workspace = true, features = ["multipart"] }
+futures-util.workspace = true
+libloading.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "macros"] }
+
+[dev-dependencies]
+arrow-array.workspace = true
+arrow-buffer.workspace = true

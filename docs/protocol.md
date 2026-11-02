@@ -80,7 +80,7 @@ The query text is a FlatPPL module. Its bindings are restricted to the black-box
 - **Box.** Exactly one binding `B = load_module("box:<name>")`, where `<name>` is a box on this server. The alias `B` is free.
 - **Data.** Any number of bindings `D = load_data(S, V)`. `S` is `"part:<name>"`, a data part of this request, or `"sha256:<hex>"`, an object in the store. `V` is the value set of the data, and must not be `anything` (spec §07 refuses access to such data). The server checks the data against `V`. A request part is also stored under its hash, so a later request may refer to it by hash.
 - **Literals.** Any number of bindings to scalar literals, array literals of scalars, and record literals of these.
-- **RNG.** Bindings `R = rnginit(seed)` and `R = rngstate(bytes)`, where `seed` is an integer or byte-vector literal and `bytes` is a byte-vector literal or a data binding.
+- **RNG.** Bindings `R = rnginit(seed)` and `R = rngstate(bytes)`, where `seed` is an integer or byte-vector literal and `bytes` is a byte-vector literal or a data binding. An array of RNG states for a batched sample is `R = broadcast(rnginit, seeds)` or `R = broadcast(rngstate, states)`, also written `rnginit.(seeds)` and `rngstate.(states)`. `seeds` is a vector of integers or of byte vectors, and `states` a vector of byte vectors, each a literal or a data binding.
 - **Result.** Exactly one binding named `result`, with one of the forms below.
 
 An argument is a binding name, a literal, or a record literal of these. `M` is a member of the box, written `B.M`.
@@ -94,12 +94,17 @@ An argument is a binding name, a literal, or a record literal of these. `M` is a
 | `builtin_sample(rng, B.M, n, ...)` | Draw from measure member `M`. The sizes are optional. |
 | `builtin_touniform(B.K, input, x)`, and the other three transports | Transport (spec §07), if the member supports it. |
 | `broadcast(callee, args...)` | Batch one of the forms above. |
+| `broadcast(builtin_sample, rngs, B.K, input, n, ...)` | Draw from kernel member `K` once per row, row `i` with RNG state `i` of the array `rngs`. |
 
 A measure member is a nullary kernel (spec §06). FlatPPL has no empty-record literal, so a measure member takes no `input` argument. The server resolves the arity from the member kind.
 
-`broadcast` follows spec §04. `callee` is a function member, or one of `builtin_logdensityof` and the four transports. Array arguments are iterated elementwise, tables row-wise, and members and scalars are held constant. Size-one axes expand. An element of an array is its entry, so a matrix broadcasts to scalars, and an array of vectors broadcasts one vector per row. For example, `broadcast(builtin_logdensityof, B.M, thetas)` with `thetas` in `cartpow(cartpow(reals, 2), 100)` gives 100 log densities, and with `thetas` in `cartpow(reals, [100, 2])` it gives 200. `builtin_sample` is not batched in version 1, because a shared RNG state would correlate the rows.
+`broadcast` follows spec §04. `callee` is a function member, or one of `builtin_logdensityof` and the four transports. Array arguments are iterated elementwise, tables row-wise, and members and scalars are held constant. Size-one axes expand. An element of an array is its entry, so a matrix broadcasts to scalars, and an array of vectors broadcasts one vector per row. For example, `broadcast(builtin_logdensityof, B.M, thetas)` with `thetas` in `cartpow(cartpow(reals, 2), 100)` gives 100 log densities, and with `thetas` in `cartpow(reals, [100, 2])` it gives 200.
+
+`broadcast(builtin_sample, rngs, ...)` takes an array of RNG states, one per row. `rngs` has one axis and its length is the number of rows. It never expands, so the other collections have one axis as well. The sizes are scalars, held constant. A single RNG state, or an array of one state for several rows, is refused with 422, because rows that share a state are correlated. Row `i` equals the unbatched query with state `i`.
 
 A table is accepted only as a `broadcast` operand in version 1.
+
+The server checks data parts against their value sets. It also checks the arguments of the result against the value sets that the member declares (see Describe): the input of every query, and the point of `builtin_logdensityof`, `builtin_touniform` and `builtin_tonormal` against the variate. Under `broadcast` it checks each row. The check covers shape, integer versus real, and interval bounds, and refuses a mismatch with 400. An integer is a real (spec §03), but a real is never an integer. The box may check more.
 
 Version 1 refuses all other forms with 422. Examples are measure algebra on a member, a query on two boxes, and computation on data.
 
@@ -123,7 +128,7 @@ result = builtin_logdensityof(bb.K, theta, x)
 
 - `wrt` lists data or literal binding names of the query. The server returns one derivative per name.
 - `gradient` returns the gradient of the sum of all result entries. For a scalar result this is the ordinary gradient. For a broadcast it is the per-row gradient for a batched argument, and the sum over rows for a held-constant argument.
-- `vjp` returns the vector-Jacobian product with the cotangent. `cotangent` names a data binding of the query whose value has the shape of the result.
+- `vjp` returns the vector-Jacobian product with the cotangent. `cotangent` names a data binding of the query whose value has the shape of the result. For a result that is an array of arrays, the multi-axis array of the same entries is accepted too.
 - A derivative of `builtin_sample`, a derivative the member does not support, or a derivative with respect to an integer or boolean binding is refused with 422.
 
 ### RNG state
@@ -131,6 +136,7 @@ result = builtin_logdensityof(bb.K, theta, x)
 - The box defines its RNG algorithm and the byte encoding of its state. The encoding must identify the algorithm, so that the box refuses a foreign state with 422.
 - `rnginit(seed)` starts a fresh state. An integer seed `n` means the 8-byte little-endian encoding of `n` (spec §07).
 - `rngstate(bytes)` resumes a state that a previous reply returned.
+- A batched sample returns one new state per row. The client resumes row `i` with state `i`, for example through `rngstate.(states)` with the `rngstate` part as a data part.
 - A sampling reply carries the new state. The client passes it to the next sampling query. Equal states and equal queries give equal samples.
 
 ### Reply
@@ -141,7 +147,11 @@ A successful query returns 200 with `multipart/mixed`. Each part is an Arrow IPC
 |---|---|---|
 | `value` | always | The result. For `builtin_sample`, the samples `X`. |
 | `d_<name>` | for each `wrt` name | The derivative, with the shape of binding `<name>`. |
-| `rngstate` | for `builtin_sample` | The new RNG state: a vector of integers in `0..255`. |
+| `rngstate` | for `builtin_sample` | The new RNG state: a vector of integers in `0..255`. For a batched sample, an array with one such vector per row. |
+
+The result of a `broadcast` is the array of the per-row results (spec §04). A result that is an array stays one element, so the reply is an array of arrays, encoded as nested `FixedSizeList`s. For example, a function from reals to `cartpow(reals, 2)` broadcast over 3 rows gives 3 vectors, in `cartpow(cartpow(reals, 2), 3)`. The samples `X` of `builtin_sample` with sizes `n, ...` are an array of that shape whose elements are variates (spec §06 `iid`). A batched sample is the array of the per-row `X`. A kernel with variate `cartpow(reals, 2)` gives `cartpow(cartpow(reals, 2), 3)` over 3 rows, and `cartpow(cartpow(cartpow(reals, 2), 4), 3)` with size 4.
+
+An array of arrays and a multi-axis array have the same Arrow type, so the `flatppl.valueset` metadata tells them apart. It uses the member's declared `output` or `variate` set, and the server refuses a box result outside that set with 500. For a member that declares `anything`, nested lists in a result read as a multi-axis array.
 
 Parts come in this order. The `value` part may stream in several record batches, so a client can read a large result before the reply ends.
 
