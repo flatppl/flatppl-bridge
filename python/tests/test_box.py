@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
+
 import numpy as np
+import pyarrow as pa
 import pytest
 import requests
 from scipy import stats
@@ -41,6 +44,13 @@ def _normal_box(calls: list | None = None) -> fb.Box:
         normalized=True,
     )
     box.measure("std", sample=lambda size, rng: rng.standard_normal(size + (2,)), variate="cartpow(reals, 2)", normalized=True)
+    box.kernel(
+        "shifted",
+        sample=lambda mu, size, rng: mu + rng.standard_normal(size + mu.shape),
+        input="cartpow(reals, 2)",
+        variate="cartpow(reals, 2)",
+        normalized=True,
+    )
 
     def picky(x):
         if np.any(x < 0):
@@ -59,9 +69,20 @@ def server():
 
 
 def test_describe_lists_the_members(server):
-    text = requests.get(f"{server.url}/v1/boxes/py/describe", timeout=10).text
-    assert 'norm2 = record(kind = "function", queries = ["apply"], gradient = true, vjp = true' in text
-    assert 'std = record(kind = "measure", queries = ["builtin_sample"]' in text
+    response = requests.get(f"{server.url}/v1/boxes/py/describe", timeout=10)
+    assert response.headers["content-type"] == "application/json"
+    members = response.json()
+    assert members["norm2"] == {
+        "kind": "function",
+        "queries": ["apply"],
+        "gradient": True,
+        "vjp": True,
+        "input": "cartpow(reals, 3)",
+        "output": "reals",
+    }
+    assert members["std"]["queries"] == ["builtin_sample"]
+    assert members["std"]["variate"] == "cartpow(reals, 2)"
+    assert json.loads(fb.Box().describe()) == {}
 
 
 def test_application_gradient_and_vjp(server):
@@ -150,3 +171,90 @@ def test_token():
     with fb.Server({"py": _normal_box()}, token="s3cret") as s:
         assert requests.get(f"{s.url}/v1/boxes", timeout=10).status_code == 401
         assert query(s.url, HEAD + "result = py.expm(1.0)\n", token="s3cret").status == 200
+
+
+def _numpy_rng(seed: int) -> np.random.Generator:
+    return np.random.Generator(np.random.PCG64(np.random.SeedSequence(list(seed.to_bytes(8, "little")))))
+
+
+def _literal(state) -> str:
+    return "[" + ", ".join(str(int(b)) for b in state) + "]"
+
+
+def _reals(vector) -> str:
+    return "[" + ", ".join(repr(float(x)) for x in vector) + "]"
+
+
+def test_batched_sampling_equals_unbatched_draws_per_row(server):
+    mus = np.array([[0.0, 1.0], [10.0, 20.0], [-5.0, 5.0]])
+    head = HEAD + 'mus = load_data("part:mus", cartpow(cartpow(reals, 2), 3))\n'
+    text = head + "result = broadcast(builtin_sample, rnginit.([11, 12, 13]), py.shifted, mus, 4)\n"
+    parts = query(server.url, text, {"mus": mus}).parts()
+    assert parts["value"].shape == (3, 4, 2)
+    states = parts["rngstate"]
+    assert states.shape[0] == 3
+    for row, seed in enumerate([11, 12, 13]):
+        expected = mus[row] + _numpy_rng(seed).standard_normal((4, 2))
+        np.testing.assert_array_equal(parts["value"][row], expected)
+        single = HEAD + f"result = builtin_sample(rnginit({seed}), py.shifted, {_reals(mus[row])}, 4)\n"
+        one = query(server.url, single).parts()
+        np.testing.assert_array_equal(one["value"], parts["value"][row])
+        np.testing.assert_array_equal(one["rngstate"], states[row])
+
+    # Resume every row from the state the batched reply returned.
+    text = head + f's = load_data("part:s", cartpow(cartpow(integers, {states.shape[1]}), 3))\n'
+    text += "result = broadcast(builtin_sample, rngstate.(s), py.shifted, mus, 4)\n"
+    resumed = query(server.url, text, {"mus": mus, "s": states}).parts()["value"]
+    for row in range(3):
+        single = HEAD + f"result = builtin_sample(rngstate({_literal(states[row])}), py.shifted, {_reals(mus[row])}, 4)\n"
+        np.testing.assert_array_equal(query(server.url, single).parts()["value"], resumed[row])
+
+    # A measure member: one draw per row.
+    text = HEAD + "result = broadcast(builtin_sample, rnginit.([1, 2]), py.std)\n"
+    value = query(server.url, text).parts()["value"]
+    np.testing.assert_array_equal(value, [_numpy_rng(1).standard_normal(2), _numpy_rng(2).standard_normal(2)])
+
+
+@pytest.mark.parametrize(
+    "rng",
+    ["rnginit(1)", "rnginit.([1])"],
+)
+def test_batched_sampling_refuses_a_shared_rng_state(server, rng):
+    text = HEAD + f'mus = load_data("part:mus", cartpow(cartpow(reals, 2), 3))\nresult = broadcast(builtin_sample, {rng}, py.shifted, mus)\n'
+    reply = query(server.url, text, {"mus": np.zeros((3, 2))})
+    assert reply.status == 422, reply.body
+
+
+def _list_part(rows: np.ndarray) -> bytes:
+    column = pa.array([list(r) for r in rows], type=pa.list_(pa.float64()))
+    table = pa.table({"xs": column})
+    sink = pa.BufferOutputStream()
+    with pa.ipc.new_stream(sink, table.schema) as writer:
+        writer.write_table(table)
+    return sink.getvalue().to_pybytes()
+
+
+def test_a_batch_of_vectors_reaches_the_callable_one_vector_per_row():
+    calls = []
+    xs = np.arange(12.0).reshape(4, 3)
+    with fb.Server({"py": _normal_box(calls)}) as s:
+        text = HEAD + 'xs = load_data("part:xs", cartpow(cartpow(reals, 3), 4))\nresult = py.norm2.(xs)\n'
+        np.testing.assert_array_equal(query(s.url, text, {"xs": xs}).parts()["value"], np.sum(xs**2, axis=1))
+        np.testing.assert_array_equal(query(s.url, text, {"xs": _list_part(xs)}).parts()["value"], np.sum(xs**2, axis=1))
+        assert calls == [4, 4]
+        # A matrix broadcasts to scalars, which are not in cartpow(reals, 3).
+        text = HEAD + 'xs = load_data("part:xs", cartpow(reals, [4, 3]))\nresult = py.norm2.(xs)\n'
+        assert query(s.url, text, {"xs": xs}).status == 400
+        assert calls == [4, 4]
+
+
+def test_the_server_checks_inputs_before_the_callable():
+    calls = []
+    with fb.Server({"py": _normal_box(calls)}) as s:
+        assert query(s.url, HEAD + "result = py.norm2([1.0, 2.0])\n").status == 400
+        assert query(s.url, HEAD + "result = py.norm2([true, false, true])\n").status == 400
+        assert calls == []
+        text = HEAD + "result = builtin_logdensityof(py.normal, (mu = 0.0, sigma = -1.0), 0.3)\n"
+        reply = query(s.url, text)
+        assert reply.status == 400
+        assert "posreals" in reply.json()["detail"]

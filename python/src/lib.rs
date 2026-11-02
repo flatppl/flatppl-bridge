@@ -173,9 +173,15 @@ impl Plugin for PyPlugin {
             let tree = |a: &Option<ArrayRef>| a.as_ref().map(|a| to_tree(py, a)).transpose();
             let input = tree(&call.input).map_err(failure)?;
             let point = tree(&call.point).map_err(failure)?;
-            let rng = call.rng.as_ref().map(|r| match r {
-                Rng::Seed(b) => ("seed", PyBytes::new(py, b)),
-                Rng::State(b) => ("state", PyBytes::new(py, b)),
+            // One RNG state per row of a sample.
+            let rng: Option<Vec<_>> = (!call.rng.is_empty()).then(|| {
+                call.rng
+                    .iter()
+                    .map(|r| match r {
+                        Rng::Seed(b) => ("seed", PyBytes::new(py, b)),
+                        Rng::State(b) => ("state", PyBytes::new(py, b)),
+                    })
+                    .collect()
             });
             let derivative = match &call.derivative {
                 None => None,
@@ -222,9 +228,9 @@ impl Plugin for PyPlugin {
                 item(1)?.ok_or_else(|| Error::Failure("Python returned no value".into()))?;
             let rng = reply.get_item(4).map_err(failure)?;
             let rng = if rng.is_none() {
-                None
+                Vec::new()
             } else {
-                Some(rng.extract::<Vec<u8>>().map_err(failure)?)
+                rng.extract::<Vec<Vec<u8>>>().map_err(failure)?
             };
             Ok(Output {
                 value,

@@ -53,10 +53,10 @@ with fb.Server({"physics": box}) as server:
 ## Conventions
 
 - **Batches.** A callable gets a batch of rows: an array argument has the row axis first, and a record argument is a dict of such arrays. It returns its results with the same row axis. A FlatPPL `broadcast` over many points reaches the callable once.
-- **Samplers** get one input without a row axis, a size tuple and a `numpy.random.Generator`. They return an array of shape `size` plus the variate shape. Only a normalized member can sample, because only a probability measure has samples.
-- **Value sets** are FlatPPL text, such as `"cartpow(reals, 3)"`. The default `"anything"` leaves the checks to the callable.
+- **Samplers** get one input without a row axis, a size tuple and a `numpy.random.Generator`. They return an array of shape `size` plus the variate shape. Under `broadcast(builtin_sample, rngs, ...)` the box calls the sampler once per row, each with its own RNG state. Only a normalized member can sample, because only a probability measure has samples.
+- **Value sets** are FlatPPL set expressions, such as `"cartpow(reals, 3)"`. The server checks every input and point against them before it calls the box, so a callable sees only values in its sets. The default `"anything"` leaves the checks to the callable.
 - **Derivatives.** A function's `vjp(x, cotangent)` returns the vector-Jacobian product, shaped like `x`. The member then also answers gradients. A kernel's `gradient(input, x)` returns `(d_input, d_x)`. A measure's `gradient(x)` returns `d_x`.
-- **Random numbers.** The box uses NumPy's PCG64. A query seeds it with `rnginit(seed)`, and the reply carries the new state, which the next query passes back with `rngstate(...)`. Equal states give equal samples.
+- **Random numbers.** The box uses NumPy's PCG64. A query seeds it with `rnginit(seed)`, and the reply carries the new state, which the next query passes back with `rngstate(...)`. A batched sample has one state per row. Equal states give equal samples.
 - **Errors.** Raise `fb.InvalidInput` to reject an input (HTTP 400). Raise `NotImplementedError` for an unsupported query (HTTP 422). Any other exception is a box failure (HTTP 500). A degenerate result is a value: return `-inf` for a log density outside the support.
 
 Input arrays are read-only views. Copy one before changing it.

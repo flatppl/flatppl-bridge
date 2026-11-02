@@ -32,3 +32,17 @@ def test_log_density_and_gradient_match_bridgestan():
     value, grad = direct.log_density_gradient(u, propto=False, jacobian=True)
     assert parts["value"] == value
     np.testing.assert_array_equal(parts["d_u"], grad)
+
+
+def test_a_batch_of_theta_vectors_matches_bridgestan_per_row():
+    bridgestan = pytest.importorskip("bridgestan")
+    model = f"{MODELS}/normal_model.so"
+    thetas = np.array([[0.3, 0.2], [-1.0, 0.5], [2.0, -0.7]])
+    with fb.Server(libraries={"stan": (PLUGIN, json.dumps({"model": model}))}) as server:
+        text = 'stan = load_module("box:stan")\nthetas = load_data("part:thetas", cartpow(cartpow(reals, 2), 3))\nresult = builtin_logdensityof.(stan.posterior, thetas)\n'
+        parts = query(server.url, text, {"thetas": thetas}, {"derivative": {"kind": "gradient", "wrt": ["thetas"]}}).parts()
+    direct = bridgestan.StanModel(model)
+    for row, theta in enumerate(thetas):
+        value, grad = direct.log_density_gradient(theta, propto=False, jacobian=True)
+        assert parts["value"][row] == value
+        np.testing.assert_array_equal(parts["d_thetas"][row], grad)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import traceback
 from dataclasses import dataclass, field
@@ -39,24 +40,23 @@ class _Member:
     sample: Callable | None = None
     queries: list[str] = field(default_factory=list)
 
-    def describe(self, name: str) -> str:
-        fields = [f'kind = "{self.kind}"']
-        fields.append("queries = [" + ", ".join(f'"{q}"' for q in self.queries) + "]")
+    def describe(self) -> dict:
+        """The member object of the describe JSON."""
         # A function's gradient is its VJP with a cotangent of ones.
         gradient = self.vjp if self.kind == "function" else self.gradient
-        fields.append(f"gradient = {_bool(gradient is not None)}")
-        fields.append(f"vjp = {_bool(self.vjp is not None)}")
+        member = {
+            "kind": self.kind,
+            "queries": self.queries,
+            "gradient": gradient is not None,
+            "vjp": self.vjp is not None,
+        }
         if self.kind == "function":
-            fields += [f"input = {self.input}", f"output = {self.output}"]
+            member.update(input=self.input, output=self.output)
         else:
             if self.kind == "kernel":
-                fields.append(f"input = {self.input}")
-            fields += [f"variate = {self.variate}", f"normalized = {_bool(self.normalized)}"]
-        return f"{name} = record({', '.join(fields)})"
-
-
-def _bool(value: bool) -> str:
-    return "true" if value else "false"
+                member["input"] = self.input
+            member.update(variate=self.variate, normalized=self.normalized)
+        return member
 
 
 class Box:
@@ -65,10 +65,12 @@ class Box:
     Every callable works on a batch of rows. An array argument has the row axis
     first, and a record argument is a dict of such arrays. A callable returns
     its results with the same row axis. A sampler is the exception: it sees one
-    input without a row axis.
+    input without a row axis, and under a batched sample the box calls it once
+    per row, each with its own RNG state.
 
-    Value sets are FlatPPL text, for example ``"cartpow(reals, 3)"``. The
-    default ``"anything"`` leaves the checks to the callable.
+    Value sets are FlatPPL set expressions, for example ``"cartpow(reals, 3)"``.
+    The server checks inputs and points against them before it calls the box.
+    The default ``"anything"`` leaves the checks to the callable.
     """
 
     def __init__(self) -> None:
@@ -157,8 +159,8 @@ class Box:
         self._members[name] = member
 
     def describe(self) -> str:
-        """The describe text of this box (see docs/protocol.md)."""
-        return "".join(m.describe(n) + "\n" for n, m in self._members.items())
+        """The describe JSON of this box (see docs/protocol.md)."""
+        return json.dumps({n: m.describe() for n, m in self._members.items()})
 
     def _dispatch(self, op, member, rows, input, point, sizes, rng, derivative):
         try:
@@ -202,16 +204,21 @@ class Box:
                 else:
                     d_point = _rows(grads, rows, "the gradient") if wrt_point else None
         elif op == "sample" and m.sample is not None:
-            generator = _generator(rng)
+            if rng is None or len(rng) != rows:
+                raise InvalidInput("sampling needs one RNG state per row")
             size = tuple(int(n) for n in sizes)
-            single = _unrow(x) if m.kind == "kernel" else None
-            args = (single, size, generator) if m.kind == "kernel" else (size, generator)
-            draws = np.asarray(m.sample(*args))
             count = int(np.prod(size)) if size else 1
-            if draws.shape[: len(size)] != size:
-                raise ValueError(f"the sampler returned shape {draws.shape} for size {size}")
-            value = draws.reshape((count,) + draws.shape[len(size) :])
-            new_rng = _state(generator)
+            draws, new_rng = [], []
+            # Row i draws from state i alone, so it equals an unbatched draw.
+            for row in range(rows):
+                generator = _generator(rng[row])
+                args = (_row(x, row), size, generator) if m.kind == "kernel" else (size, generator)
+                draw = np.asarray(m.sample(*args))
+                if draw.shape[: len(size)] != size:
+                    raise ValueError(f"the sampler returned shape {draw.shape} for size {size}")
+                draws.append(draw.reshape((count,) + draw.shape[len(size) :]))
+                new_rng.append(_state(generator))
+            value = np.concatenate(draws)
         else:
             raise NotImplementedError(f"{name!r} does not answer {op}")
         return ("ok", _tree(value), _tree(d_input), _tree(d_point), new_rng)
@@ -258,13 +265,11 @@ def _rows(value, rows, what):
     return value
 
 
-def _unrow(value):
-    """Drop the row axis of a one-row value."""
-    if value is None:
-        return None
+def _row(value, row):
+    """Row ``row`` of a value, without the row axis."""
     if isinstance(value, Mapping):
-        return {k: _unrow(v) for k, v in value.items()}
-    array = value[0]
+        return {k: _row(v, row) for k, v in value.items()}
+    array = value[row]
     return array.item() if array.ndim == 0 else array
 
 
