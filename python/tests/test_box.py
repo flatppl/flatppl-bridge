@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 
 import numpy as np
@@ -216,14 +217,27 @@ def test_batched_sampling_equals_unbatched_draws_per_row(server):
     np.testing.assert_array_equal(value, [_numpy_rng(1).standard_normal(2), _numpy_rng(2).standard_normal(2)])
 
 
-@pytest.mark.parametrize(
-    "rng",
-    ["rnginit(1)", "rnginit.([1])"],
-)
-def test_batched_sampling_refuses_a_shared_rng_state(server, rng):
-    text = HEAD + f'mus = load_data("part:mus", cartpow(cartpow(reals, 2), 3))\nresult = broadcast(builtin_sample, {rng}, py.shifted, mus)\n'
-    reply = query(server.url, text, {"mus": np.zeros((3, 2))})
-    assert reply.status == 422, reply.body
+def _split_seed(kind: int, parent: bytes, n: int, i: int) -> str:
+    """The split of protocol "RNG state", computed from its text."""
+    h = hashlib.sha256(b"flatppl-blackbox/rng-split/v1")
+    h.update(bytes([kind]) + len(parent).to_bytes(8, "little") + parent)
+    h.update(n.to_bytes(8, "little") + i.to_bytes(8, "little"))
+    return _literal(h.digest())
+
+
+@pytest.mark.parametrize("rng", ["rnginit(1)", "rnginit.([1])"])
+def test_batched_sampling_splits_a_shared_rng_state(server, rng):
+    mus = np.array([[0.0, 1.0], [10.0, 11.0], [-5.0, -4.0]])
+    text = HEAD + f'mus = load_data("part:mus", cartpow(cartpow(reals, 2), 3))\nresult = broadcast(builtin_sample, {rng}, py.shifted, mus, 4)\n'
+    parts = query(server.url, text, {"mus": mus}).parts()
+    value, states = parts["value"], parts["rngstate"]
+    assert len(states) == 3
+    for row in range(3):
+        seed = _split_seed(1, (1).to_bytes(8, "little"), 3, row)
+        single = HEAD + f"result = builtin_sample(rnginit({seed}), py.shifted, {_reals(mus[row])}, 4)\n"
+        one = query(server.url, single).parts()
+        np.testing.assert_array_equal(one["value"], value[row])
+        np.testing.assert_array_equal(one["rngstate"], states[row])
 
 
 def _list_part(rows: np.ndarray) -> bytes:

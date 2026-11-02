@@ -94,13 +94,13 @@ An argument is a binding name, a literal, or a record literal of these. `M` is a
 | `builtin_sample(rng, B.M, n, ...)` | Draw from measure member `M`. The sizes are optional. |
 | `builtin_touniform(B.K, input, x)`, and the other three transports | Transport (spec §07), if the member supports it. |
 | `broadcast(callee, args...)` | Batch one of the forms above. |
-| `broadcast(builtin_sample, rngs, B.K, input, n, ...)` | Draw from kernel member `K` once per row, row `i` with RNG state `i` of the array `rngs`. |
+| `broadcast(builtin_sample, rng, B.K, input, n, ...)` | Draw from kernel member `K` once per row. `rng` is one RNG state, or an array of one state per row. |
 
 A measure member is a nullary kernel (spec §06). FlatPPL has no empty-record literal, so a measure member takes no `input` argument. The server resolves the arity from the member kind.
 
 `broadcast` follows spec §04. `callee` is a function member, or one of `builtin_logdensityof` and the four transports. Array arguments are iterated elementwise, tables row-wise, and members and scalars are held constant. Size-one axes expand. An element of an array is its entry, so a matrix broadcasts to scalars, and an array of vectors broadcasts one vector per row. For example, `broadcast(builtin_logdensityof, B.M, thetas)` with `thetas` in `cartpow(cartpow(reals, 2), 100)` gives 100 log densities, and with `thetas` in `cartpow(reals, [100, 2])` it gives 200.
 
-`broadcast(builtin_sample, rngs, ...)` takes an array of RNG states, one per row. `rngs` has one axis and its length is the number of rows. It never expands, so the other collections have one axis as well. The sizes are scalars, held constant. A single RNG state, or an array of one state for several rows, is refused with 422, because rows that share a state are correlated. Row `i` equals the unbatched query with state `i`.
+`broadcast(builtin_sample, rng, ...)` takes one RNG state or an array of RNG states. An array of states has one axis and expands like any collection, so the other collections have one axis as well. The sizes are scalars, held constant. The rows count in row-major order. If several rows share one state, the server splits it into one state per row (see RNG state), because fan-out splits RNG states (spec §07). Row `i` equals the unbatched query with the state of row `i`.
 
 A table is accepted only as a `broadcast` operand in version 1.
 
@@ -136,6 +136,12 @@ result = builtin_logdensityof(bb.K, theta, x)
 - The box defines its RNG algorithm and the byte encoding of its state. The encoding must identify the algorithm, so that the box refuses a foreign state with 422.
 - `rnginit(seed)` starts a fresh state. An integer seed `n` means the 8-byte little-endian encoding of `n` (spec §07).
 - `rngstate(bytes)` resumes a state that a previous reply returned.
+- A split of one state into `n` row states gives row `i` the state `rnginit(s_i)`. The seed `s_i` is the 32-byte SHA-256 of the concatenation of:
+  - the ASCII tag `flatppl-blackbox/rng-split/v1`;
+  - one kind byte, 1 for `rnginit(seed)` and 2 for `rngstate(bytes)`;
+  - the length of the parent in bytes, the parent, `n` and `i`, each integer as 8 bytes little-endian. The parent is the seed bytes or the state bytes.
+
+  The split does not depend on the box, so a client can reproduce each row. The server does not check a split state, so a split never refuses a foreign state.
 - A batched sample returns one new state per row. The client resumes row `i` with state `i`, for example through `rngstate.(states)` with the `rngstate` part as a data part.
 - A sampling reply carries the new state. The client passes it to the next sampling query. Equal states and equal queries give equal samples.
 
