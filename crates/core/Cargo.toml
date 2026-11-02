@@ -1,0 +1,12 @@
+[package]
+name = "flatppl-bridge"
+description = "Core of the FlatPPL black-box server: query checks, the content store and plugin dispatch."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+flatppl-core.workspace = true
+flatppl-syntax.workspace = true
