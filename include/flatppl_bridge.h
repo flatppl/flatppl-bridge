@@ -92,9 +92,9 @@ typedef struct fpb_call {
   fpb_array* point;     /* logdensity and transports; NULL otherwise */
   const uint64_t* sizes;   /* sample sizes, op FPB_OP_SAMPLE only */
   size_t n_sizes;
-  uint32_t rng_kind;
-  const uint8_t* rng;
-  size_t rng_len;
+  uint32_t rng_kind;       /* one kind for every row */
+  const uint8_t* rng;      /* rows states of rng_len bytes each, row-major */
+  size_t rng_len;          /* bytes per row */
   uint32_t deriv;
   uint32_t wrt;
   fpb_array* cotangent; /* FPB_DERIV_VJP only */
@@ -105,8 +105,8 @@ typedef struct fpb_result {
   fpb_array value;
   fpb_array d_input;  /* if wrt has FPB_WRT_INPUT */
   fpb_array d_point;  /* if wrt has FPB_WRT_POINT */
-  uint8_t* rng;       /* new RNG state for FPB_OP_SAMPLE, freed by release */
-  size_t rng_len;
+  uint8_t* rng;       /* FPB_OP_SAMPLE: rows new states, row-major, freed by release */
+  size_t rng_len;     /* bytes per row */
   char* error;        /* message if status is not FPB_OK, freed by release */
   void* private_data;
 } fpb_result;
@@ -115,7 +115,7 @@ typedef struct fpb_result {
 typedef struct fpb_plugin {
   uint32_t abi_version;
   void* state;
-  /* FlatPPL describe text, valid until destroy. NULL on failure. */
+  /* Describe JSON (docs/protocol.md), valid until destroy. NULL on failure. */
   const char* (*describe)(void* state);
   int32_t (*call)(void* state, const fpb_call* call, fpb_result* out);
   /* Free rng, error and private_data of a result. Arrays are released by the core. */

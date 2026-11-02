@@ -545,6 +545,7 @@ name = "flatppl-bridge"
 version = "0.1.0"
 dependencies = [
  "arrow-array",
+ "arrow-buffer",
  "arrow-cast",
  "arrow-ipc",
  "arrow-schema",
@@ -627,6 +628,7 @@ name = "fpb-testbox"
 version = "0.1.0"
 dependencies = [
  "arrow-array",
+ "arrow-buffer",
  "arrow-ipc",
  "arrow-schema",
  "arrow-select",
@@ -634,6 +636,7 @@ dependencies = [
  "flatppl-bridge-abi",
  "libm",
  "reqwest",
+ "serde_json",
  "tokio",
 ]
 

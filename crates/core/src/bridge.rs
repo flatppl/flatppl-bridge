@@ -10,9 +10,10 @@ use flatppl_bridge_abi::Plugin;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-/// A box: a plugin and its parsed describe records.
+/// A box: a plugin and its parsed describe members.
 pub struct BoxEntry {
     pub plugin: Arc<dyn Plugin>,
+    /// The canonical describe JSON.
     pub describe: String,
     pub members: BTreeMap<String, Member>,
 }
@@ -57,6 +58,7 @@ impl Bridge {
             .describe()
             .map_err(|e| format!("box `{name}`: {e}"))?;
         let members = describe::parse(&describe).map_err(|e| format!("box `{name}`: {e}"))?;
+        let describe = describe::to_json(&members);
         self.boxes.insert(
             name.to_owned(),
             BoxEntry {

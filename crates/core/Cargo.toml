@@ -25,3 +25,4 @@ tokio = { workspace = true, features = ["rt-multi-thread", "net", "macros"] }
 
 [dev-dependencies]
 arrow-array.workspace = true
+arrow-buffer.workspace = true

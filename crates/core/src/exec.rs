@@ -4,7 +4,8 @@
 use crate::describe::{Kind, Member};
 use crate::error::{BridgeError, bad, unsupported};
 use crate::query::{Operand, Query, RngSpec, bytes_of};
-use crate::value::{Value, flatten, from_elements, nest, struct_array};
+use crate::set::Set;
+use crate::value::{Value, conform, flatten, from_elements, nest, struct_array};
 use arrow_array::cast::AsArray;
 use arrow_array::types::Float64Type;
 use arrow_array::{Array, ArrayRef, Float32Array, Float64Array, Int64Array, UInt64Array};
@@ -155,9 +156,21 @@ pub fn execute(
 
     let (input, point, rest) = slots(query, member)?;
     let mut sizes = Vec::new();
-    let mut rng = None;
+    let mut rng = Vec::new();
+    let mut rng_rows = None;
     if result.op == Op::Sample {
-        rng = Some(rng_of(query, values, &result.args[0])?);
+        let batched;
+        (rng, batched) = rng_of(query, values, &result.args[0])?;
+        match (result.broadcast, batched) {
+            (true, false) => {
+                return Err(unsupported(
+                    "a shared RNG state would correlate the rows: give `broadcast(builtin_sample, ...)` one RNG state per row",
+                ));
+            }
+            (false, true) => return Err(bad("an array of RNG states needs `broadcast`")),
+            (true, true) => rng_rows = Some(rng.len()),
+            (false, false) => {}
+        }
         for size in rest {
             let n = match resolve(values, size)? {
                 Value::Array { shape, data }
@@ -184,7 +197,7 @@ pub fn execute(
 
     let mut occurrences = Vec::new();
     let (rows, batch, input, point) = if result.broadcast {
-        broadcast(values, input, point, &mut occurrences)?
+        broadcast(values, input, point, rng_rows, &mut occurrences)?
     } else {
         let mut whole = |slot, arg: Option<SlotArg>| -> Result<Option<ArrayRef>, BridgeError> {
             let Some(arg) = arg else { return Ok(None) };
@@ -252,6 +265,15 @@ pub fn execute(
         }
     };
 
+    // The core checks the declared sets, so that closed plugins need not.
+    let input = within(input, member.input.as_ref(), "input", &result.member)?;
+    let point = match result.op {
+        Op::LogDensity | Op::ToUniform | Op::ToNormal => {
+            within(point, member.variate.as_ref(), "point", &result.member)?
+        }
+        _ => point,
+    };
+
     let output = plugin.call(Call {
         op: result.op,
         member: result.member.clone(),
@@ -264,7 +286,11 @@ pub fn execute(
     })?;
 
     let value_batch: Vec<usize> = if result.op == Op::Sample {
-        sizes.iter().map(|&n| n as usize).collect()
+        batch
+            .iter()
+            .copied()
+            .chain(sizes.iter().map(|&n| n as usize))
+            .collect()
     } else {
         batch.clone()
     };
@@ -294,21 +320,50 @@ pub fn execute(
         }
     }
     if result.op == Op::Sample {
-        let state = output
-            .rng
-            .ok_or_else(|| BridgeError::Failure("the box returned no RNG state".into()))?;
+        let states = &output.rng;
+        let len = states.first().map_or(0, Vec::len);
+        if states.len() != rows || len == 0 || states.iter().any(|s| s.len() != len) {
+            return Err(BridgeError::Failure(
+                "the box returned no RNG state, or states of different lengths".into(),
+            ));
+        }
         let data: ArrayRef = Arc::new(Int64Array::from(
-            state.iter().map(|&b| b as i64).collect::<Vec<_>>(),
+            states
+                .concat()
+                .iter()
+                .map(|&b| b as i64)
+                .collect::<Vec<_>>(),
         ));
-        parts.push((
-            "rngstate".to_owned(),
+        // One byte vector, or under broadcast an array of them, one per row.
+        let value = if result.broadcast {
             Value::Array {
-                shape: vec![state.len()],
+                shape: batch,
+                data: nest(data, &[len]),
+            }
+        } else {
+            Value::Array {
+                shape: vec![len],
                 data,
-            },
-        ));
+            }
+        };
+        parts.push(("rngstate".to_owned(), value));
     }
     Ok(parts)
+}
+
+/// Check the elements of a slot against the member's declared set.
+fn within(
+    array: Option<ArrayRef>,
+    set: Option<&Set>,
+    what: &str,
+    member: &str,
+) -> Result<Option<ArrayRef>, BridgeError> {
+    match (array, set) {
+        (Some(array), Some(set)) => conform(&array, set)
+            .map(Some)
+            .map_err(|e| bad(format!("the {what} of `{member}` is not in `{set}`: {e}"))),
+        (array, _) => Ok(array),
+    }
 }
 
 fn is_real(data_type: &DataType) -> bool {
@@ -405,11 +460,12 @@ fn resolve(values: &HashMap<String, Value>, op: &Operand) -> Result<Value, Bridg
     }
 }
 
+/// The RNG states of a sample, and whether they are an array (one per row).
 fn rng_of(
     query: &Query,
     values: &HashMap<String, Value>,
     op: &Operand,
-) -> Result<Rng, BridgeError> {
+) -> Result<(Vec<Rng>, bool), BridgeError> {
     let spec = match op {
         Operand::Rng(spec) => spec.as_ref(),
         Operand::Binding(name) => query
@@ -418,22 +474,66 @@ fn rng_of(
             .ok_or_else(|| bad(format!("`{name}` is not an RNG binding")))?,
         _ => return Err(bad("`builtin_sample` takes an RNG state first")),
     };
+    let byte_rows = |op: &Operand, what: &str| -> Result<Vec<Vec<u8>>, BridgeError> {
+        let error = || bad(format!("{what} takes a vector of non-empty byte vectors"));
+        let Value::Array { shape, data } = resolve(values, op)? else {
+            return Err(error());
+        };
+        let (dims, flat) = flatten(&data);
+        let ([n], [len]) = (&shape[..], &dims[..]) else {
+            return Err(error());
+        };
+        let bytes = bytes_of(&Value::Array {
+            shape: vec![n * len],
+            data: flat,
+        })
+        .filter(|_| *len > 0)
+        .ok_or_else(error)?;
+        Ok(bytes.chunks(*len).map(<[u8]>::to_vec).collect())
+    };
     match spec {
-        RngSpec::Seed(bytes) => Ok(Rng::Seed(bytes.clone())),
+        RngSpec::Seed(bytes) => Ok((vec![Rng::Seed(bytes.clone())], false)),
         RngSpec::State(op) => bytes_of(&resolve(values, op)?)
             .filter(|b| !b.is_empty())
-            .map(Rng::State)
+            .map(|b| (vec![Rng::State(b)], false))
             .ok_or_else(|| bad("`rngstate` takes a non-empty vector of integers in 0..255")),
+        RngSpec::Seeds(op) => {
+            // Integer seeds, each as its 8-byte little-endian encoding (spec §07).
+            if let Value::Array { shape, data } = resolve(values, op)?
+                && shape.len() == 1
+                && let Some(ints) = data.as_any().downcast_ref::<Int64Array>()
+            {
+                return ints
+                    .values()
+                    .iter()
+                    .map(|&n| {
+                        u64::try_from(n)
+                            .map(|n| Rng::Seed(n.to_le_bytes().to_vec()))
+                            .map_err(|_| bad("an integer seed lies in 0..2^64-1"))
+                    })
+                    .collect::<Result<_, _>>()
+                    .map(|seeds| (seeds, true));
+            }
+            let rows = byte_rows(op, "`broadcast(rnginit, seeds)`")?;
+            Ok((rows.into_iter().map(Rng::Seed).collect(), true))
+        }
+        RngSpec::States(op) => {
+            let rows = byte_rows(op, "`broadcast(rngstate, states)`")?;
+            Ok((rows.into_iter().map(Rng::State).collect(), true))
+        }
     }
 }
 
 type Batched = (usize, Vec<usize>, Option<ArrayRef>, Option<ArrayRef>);
 
 /// Iterate collection operands elementwise (spec §04) and gather each row.
+/// `rngs` is the number of RNG states of a batched sample. They count as a
+/// collection, but never expand: a state shared by rows would correlate them.
 fn broadcast(
     values: &HashMap<String, Value>,
     input: Option<SlotArg>,
     point: Option<SlotArg>,
+    rngs: Option<usize>,
     occurrences: &mut Vec<Occurrence>,
 ) -> Result<Batched, BridgeError> {
     struct Leaf {
@@ -488,7 +588,12 @@ fn broadcast(
             });
         }
     }
-    let shapes: Vec<&Vec<usize>> = leaves.iter().filter_map(|l| l.shape.as_ref()).collect();
+    let rng_shape = rngs.map(|n| vec![n]);
+    let shapes: Vec<&Vec<usize>> = leaves
+        .iter()
+        .filter_map(|l| l.shape.as_ref())
+        .chain(rng_shape.as_ref())
+        .collect();
     let axes = shapes.first().map_or(0, |s| s.len());
     if shapes.iter().any(|s| s.len() != axes) {
         return Err(bad(
@@ -514,6 +619,13 @@ fn broadcast(
                 *b = 0;
             }
         }
+    }
+    if let Some(shape) = &rng_shape
+        && batch != *shape
+    {
+        return Err(unsupported(
+            "a shared RNG state would correlate the rows: give `broadcast(builtin_sample, ...)` one RNG state per row",
+        ));
     }
     let rows: usize = batch.iter().product();
     let mut gathered: HashMap<(u8, Option<String>), ArrayRef> = HashMap::new();
@@ -588,7 +700,10 @@ fn cotangent(
             "cotangent `{name}` must be a real array binding"
         )));
     };
-    if !is_real(data.data_type()) || shape.len() < batch.len() || shape[..batch.len()] != *batch {
+    if !is_real(flatten(data).1.data_type())
+        || shape.len() < batch.len()
+        || shape[..batch.len()] != *batch
+    {
         return Err(bad(format!(
             "cotangent `{name}` does not have the shape of the result"
         )));
@@ -612,13 +727,15 @@ fn accumulate(
             "a derivative w.r.t. `{name}` needs an array binding"
         )));
     };
-    if !is_real(data.data_type()) {
+    // An array of arrays has its element arrays in `data`.
+    let (elem_dims, leaves) = flatten(data);
+    if !is_real(leaves.data_type()) {
         return Err(unsupported(format!(
             "`{name}` is not real, so it has no derivative"
         )));
     }
     let failure = |m: &str| BridgeError::Failure(format!("derivative w.r.t. `{name}`: {m}"));
-    let mut total = vec![0.0f64; shape.iter().product()];
+    let mut total = vec![0.0f64; leaves.len()];
     for occurrence in occurrences.iter().filter(|o| o.name == name) {
         let array = match occurrence.slot {
             Slot::Input => output.d_input.as_ref(),
@@ -661,7 +778,7 @@ fn accumulate(
     };
     Ok(Value::Array {
         shape: shape.clone(),
-        data,
+        data: nest(data, &elem_dims),
     })
 }
 

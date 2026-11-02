@@ -164,10 +164,6 @@ impl BridgeStan {
                 .values()
                 .as_primitive_opt::<Float64Type>()
                 .map(|a| a.values().to_vec()),
-            // A one-parameter model takes scalar points, as a broadcast over a vector gives.
-            DataType::Float64 if self.d == 1 => {
-                Some(array.as_primitive::<Float64Type>().values().to_vec())
-            }
             _ => None,
         };
         values.filter(|v| v.len() == rows * self.d).ok_or_else(|| {
@@ -178,11 +174,8 @@ impl BridgeStan {
         })
     }
 
-    fn rows(&self, values: Vec<f64>, width: usize, scalar: bool) -> ArrayRef {
+    fn rows(&self, values: Vec<f64>, width: usize) -> ArrayRef {
         let data: ArrayRef = Arc::new(Float64Array::from(values));
-        if scalar {
-            return data;
-        }
         let field = Arc::new(Field::new("item", DataType::Float64, false));
         Arc::new(FixedSizeListArray::new(field, width as i32, data, None))
     }
@@ -227,16 +220,12 @@ impl BridgeStan {
                 }
             }
         }
-        let scalar = call
-            .point
-            .as_ref()
-            .is_some_and(|p| p.data_type() == &DataType::Float64);
-        let d_point = gradient.then(|| self.rows(grad, self.d, scalar));
+        let d_point = gradient.then(|| self.rows(grad, self.d));
         Ok(Output {
             value: Arc::new(Float64Array::from(value)),
             d_input: None,
             d_point,
-            rng: None,
+            rng: Vec::new(),
         })
     }
 
@@ -265,10 +254,10 @@ impl BridgeStan {
             }
         }
         Ok(Output {
-            value: self.rows(out, self.m, false),
+            value: self.rows(out, self.m),
             d_input: None,
             d_point: None,
-            rng: None,
+            rng: Vec::new(),
         })
     }
 }
@@ -292,10 +281,11 @@ unsafe fn take_error(api: &Api, error: *mut c_char) -> String {
 impl Plugin for BridgeStan {
     fn describe(&self) -> Result<String, Error> {
         let (d, m) = (self.d, self.m);
-        Ok(format!(
-            "posterior = record(kind = \"measure\", queries = [\"builtin_logdensityof\"], gradient = true, vjp = false, variate = cartpow(reals, {d}), normalized = false)\n\
-             constrain = record(kind = \"function\", queries = [\"apply\"], gradient = false, vjp = false, input = cartpow(reals, {d}), output = cartpow(reals, {m}))\n"
-        ))
+        Ok(serde_json::json!({
+            "posterior": {"kind": "measure", "queries": ["builtin_logdensityof"], "gradient": true, "vjp": false, "variate": format!("cartpow(reals, {d})"), "normalized": false},
+            "constrain": {"kind": "function", "queries": ["apply"], "gradient": false, "vjp": false, "input": format!("cartpow(reals, {d})"), "output": format!("cartpow(reals, {m})")},
+        })
+        .to_string())
     }
 
     fn call(&self, call: Call) -> Result<Output, Error> {

@@ -13,7 +13,7 @@ struct Counting(Arc<AtomicUsize>);
 
 impl Plugin for Counting {
     fn describe(&self) -> Result<String, Error> {
-        Ok("f = record(kind = \"function\", queries = [\"apply\"], input = anything, output = anything)\n".into())
+        Ok(r#"{"f": {"kind": "function", "queries": ["apply"], "input": "anything", "output": "anything"}}"#.into())
     }
 
     fn call(&self, call: Call) -> Result<Output, Error> {
@@ -22,7 +22,7 @@ impl Plugin for Counting {
             value: call.input.unwrap(),
             d_input: None,
             d_point: None,
-            rng: None,
+            rng: Vec::new(),
         })
     }
 }

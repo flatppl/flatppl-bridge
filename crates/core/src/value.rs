@@ -22,8 +22,9 @@ const BATCH_ROWS: usize = 65_536;
 /// A FlatPPL value.
 #[derive(Clone, Debug)]
 pub enum Value {
-    /// A scalar (empty shape) or an array: row-major data of a primitive type
-    /// (`Float64`, `Float32`, `Int64` or `Boolean`).
+    /// A scalar (empty shape) or an array: the row-major elements. An element
+    /// is a primitive (`Float64`, `Float32`, `Int64` or `Boolean`), or for an
+    /// array of arrays the element array as nested `FixedSizeList`s.
     Array {
         shape: Vec<usize>,
         data: ArrayRef,
@@ -51,7 +52,7 @@ impl Value {
     /// The value set of this value, from its Arrow types.
     pub fn set(&self) -> Set {
         match self {
-            Value::Array { shape, data } => pow(scalar_set(data.data_type()), shape),
+            Value::Array { shape, data } => pow(element_set(data.data_type()), shape),
             Value::Record(fields) => {
                 Set::Record(fields.iter().map(|(n, v)| (n.clone(), v.set())).collect())
             }
@@ -260,80 +261,76 @@ fn read_batch(bytes: &[u8]) -> Result<RecordBatch, BridgeError> {
 /// Decode a data part as a value of set `set` (spec §07 `load_data`).
 pub fn decode_part(bytes: &[u8], set: &Set) -> Result<Value, BridgeError> {
     let batch = read_batch(bytes)?;
-    let value = match set {
+    let outside = |e: String| bad(format!("the part is not in `{set}`: {e}"));
+    let rows = |n: usize| {
+        if batch.num_rows() < n {
+            return Err(bad(format!(
+                "the part has {} rows, the value set needs {n}",
+                batch.num_rows()
+            )));
+        }
+        Ok(())
+    };
+    let column = |name: &str| {
+        batch
+            .column_by_name(name)
+            .ok_or_else(|| bad(format!("the part has no column `{name}`")))
+    };
+    Ok(match set {
         Set::Anything => {
             return Err(unsupported(
                 "`load_data` with value set `anything` cannot be read (spec §07)",
             ));
         }
         Set::Record(fields) => {
-            if batch.num_rows() == 0 {
-                return Err(bad("a record part needs one row"));
+            rows(1)?;
+            let mut values = Vec::new();
+            for (name, s) in fields {
+                let element = conform(&column(name)?.slice(0, 1), s).map_err(outside)?;
+                values.push((name.clone(), element_value(&element, 0)?));
             }
-            let fields = fields
-                .iter()
-                .map(|(name, _)| {
-                    let column = batch
-                        .column_by_name(name)
-                        .ok_or_else(|| bad(format!("the part has no column `{name}`")))?;
-                    Ok((name.clone(), element_value(column, 0)?))
-                })
-                .collect::<Result<Vec<_>, BridgeError>>()?;
-            Value::Record(fields)
+            Value::Record(values)
         }
         Set::Pow(elem, dims) if matches!(**elem, Set::Record(_)) => {
             let Set::Record(fields) = &**elem else {
                 unreachable!()
             };
-            let [rows] = dims[..] else {
+            let [n] = dims[..] else {
                 return Err(unsupported("a table has one axis"));
             };
-            if batch.num_rows() < rows {
-                return Err(bad(format!(
-                    "the part has {} rows, the value set needs {rows}",
-                    batch.num_rows()
-                )));
-            }
+            rows(n)?;
             let mut arrays = Vec::new();
-            for (name, _) in fields {
-                let column = batch
-                    .column_by_name(name)
-                    .ok_or_else(|| bad(format!("the part has no column `{name}`")))?;
-                let (dims, data) = flatten(&column.slice(0, rows));
-                arrays.push(nest(normalize(&data).map_err(bad)?, &dims));
+            for (name, s) in fields {
+                arrays.push(conform(&column(name)?.slice(0, n), s).map_err(outside)?);
             }
             Value::Table(struct_array(
                 fields.iter().map(|(n, _)| n.as_str()),
                 arrays,
-                rows,
+                n,
             ))
         }
-        Set::Pow(_, dims) => {
-            let column = single_column(&batch)?;
-            if column.len() < dims[0] {
-                return Err(bad(format!(
-                    "the part has {} rows, the value set needs {}",
-                    column.len(),
-                    dims[0]
-                )));
+        Set::Pow(elem, dims) => {
+            rows(dims[0])?;
+            // Each row is a sub-array of the trailing axes.
+            let row = match &dims[1..] {
+                [] => (**elem).clone(),
+                rest => Set::Pow(elem.clone(), rest.to_vec()),
+            };
+            let mut data =
+                conform(&single_column(&batch)?.slice(0, dims[0]), &row).map_err(outside)?;
+            for _ in 1..dims.len() {
+                data = data.as_fixed_size_list().values().clone();
             }
-            let (inner, data) = flatten(&column.slice(0, dims[0]));
             Value::Array {
-                shape: std::iter::once(dims[0]).chain(inner).collect(),
-                data: normalize(&data).map_err(bad)?,
+                shape: dims.clone(),
+                data,
             }
         }
-        _ => {
-            let column = single_column(&batch)?;
-            if column.is_empty() {
-                return Err(bad("a scalar part needs one row"));
-            }
-            element_value(column, 0)?
+        scalar => {
+            rows(1)?;
+            Value::scalar(conform(&single_column(&batch)?.slice(0, 1), scalar).map_err(outside)?)
         }
-    };
-    let value = coerce(value, set)?;
-    check(&value, set)?;
-    Ok(value)
+    })
 }
 
 fn single_column(batch: &RecordBatch) -> Result<&ArrayRef, BridgeError> {
@@ -346,107 +343,108 @@ fn single_column(batch: &RecordBatch) -> Result<&ArrayRef, BridgeError> {
     }
 }
 
-/// Convert integer data to reals where the set asks for reals.
-pub fn coerce(value: Value, set: &Set) -> Result<Value, BridgeError> {
-    let elem = match set {
-        Set::Pow(elem, _) => elem.as_ref(),
-        other => other,
-    };
-    match (value, set) {
-        (Value::Array { shape, data }, _)
-            if elem.scalar() == Some(Scalar::Real) && data.data_type() == &DataType::Int64 =>
-        {
-            Ok(Value::Array {
-                shape,
-                data: cast(&data, &DataType::Float64).map_err(bad)?,
-            })
-        }
-        (Value::Record(values), Set::Record(fields)) => values
-            .into_iter()
-            .map(|(name, v)| match fields.iter().find(|(n, _)| *n == name) {
-                Some((_, s)) => Ok((name, coerce(v, s)?)),
-                None => Ok((name, v)),
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map(Value::Record),
-        (value, _) => Ok(value),
+/// Check that every element of `array` lies in `set`, and return the elements
+/// in their canonical encoding: `Int64` integers, nested `FixedSizeList`s for
+/// arrays, and record fields in the order of the set. Integers become reals
+/// where the set asks for reals. The error says why an element lies outside.
+pub fn conform(array: &ArrayRef, set: &Set) -> Result<ArrayRef, String> {
+    if array.null_count() > 0 {
+        return Err("null values".into());
     }
-}
-
-/// Check that `value` lies in `set`.
-pub fn check(value: &Value, set: &Set) -> Result<(), BridgeError> {
-    let mismatch = || {
-        bad(format!(
-            "the value of set `{}` is not in `{set}`",
-            value.set()
-        ))
-    };
-    match (value, set) {
-        (_, Set::Anything) => Ok(()),
-        (Value::Array { shape, data }, _) => {
-            let (elem, dims): (&Set, &[usize]) = match set {
-                Set::Pow(elem, dims) => (elem, dims),
-                scalar => (scalar, &[]),
-            };
-            if shape != dims {
-                return Err(mismatch());
+    match set {
+        Set::Anything => Ok(array.clone()),
+        Set::Record(fields) => {
+            let rows = array.as_struct_opt().ok_or("expected a record")?;
+            if rows.num_columns() != fields.len() {
+                return Err(format!("expected {} fields", fields.len()));
             }
-            check_data(data, elem).map_err(|_| mismatch())
-        }
-        (Value::Record(values), Set::Record(fields)) => {
-            for (name, s) in fields {
-                let v = values
-                    .iter()
-                    .find(|(n, _)| n == name)
-                    .ok_or_else(|| bad(format!("the record has no field `{name}`")))?;
-                check(&v.1, s)?;
-            }
-            Ok(())
-        }
-        (Value::Table(rows), Set::Pow(elem, dims)) => {
-            let Set::Record(fields) = &**elem else {
-                return Err(mismatch());
-            };
-            if dims[..] != [rows.len()] {
-                return Err(mismatch());
-            }
+            let mut columns = Vec::new();
             for (name, s) in fields {
                 let column = rows
                     .column_by_name(name)
-                    .ok_or_else(|| bad(format!("the table has no column `{name}`")))?;
-                let (dims, data) = flatten(column);
-                check(&Value::Array { shape: dims, data }, s).map_err(|_| mismatch())?;
+                    .ok_or_else(|| format!("no field `{name}`"))?;
+                columns.push(conform(column, s).map_err(|e| format!("field `{name}`: {e}"))?);
             }
-            Ok(())
+            Ok(Arc::new(struct_array(
+                fields.iter().map(|(n, _)| n.as_str()),
+                columns,
+                array.len(),
+            )))
         }
-        _ => Err(mismatch()),
+        Set::Pow(elem, dims) => {
+            let mut values = array.clone();
+            for &size in dims {
+                values = list_values(&values, size)?;
+            }
+            Ok(nest(conform(&values, elem)?, dims))
+        }
+        scalar => {
+            let kind = scalar.scalar().expect("the other sets are scalar sets");
+            let data = match (kind, array.data_type()) {
+                (Scalar::Real, DataType::Float64 | DataType::Float32) => array.clone(),
+                (Scalar::Real, DataType::Float16) => cast(array, &DataType::Float32)?,
+                (Scalar::Real, t) if t.is_integer() => cast(array, &DataType::Float64)?,
+                (Scalar::Integer, t) if t.is_integer() => cast(array, &DataType::Int64)?,
+                (Scalar::Boolean, DataType::Boolean) => array.clone(),
+                (_, t) => return Err(format!("Arrow {t} values are not in `{scalar}`")),
+            };
+            let inside = match data.data_type() {
+                DataType::Float64 => data
+                    .as_primitive::<Float64Type>()
+                    .values()
+                    .iter()
+                    .all(|&x| scalar.contains_real(x)),
+                DataType::Float32 => data
+                    .as_primitive::<Float32Type>()
+                    .values()
+                    .iter()
+                    .all(|&x| scalar.contains_real(x as f64)),
+                DataType::Int64 => data
+                    .as_primitive::<Int64Type>()
+                    .values()
+                    .iter()
+                    .all(|&n| scalar.contains_int(n)),
+                _ => true,
+            };
+            if inside {
+                Ok(data)
+            } else {
+                Err(format!("a value lies outside `{scalar}`"))
+            }
+        }
     }
 }
 
-fn check_data(data: &ArrayRef, elem: &Set) -> Result<(), ()> {
-    if data.null_count() > 0 {
-        return Err(());
+/// The entries of a list array whose lists all have `size` entries.
+fn list_values(array: &ArrayRef, size: usize) -> Result<ArrayRef, String> {
+    let wrong = || format!("expected arrays of size {size}");
+    if array.null_count() > 0 {
+        return Err("null values".into());
     }
-    let ok = match (elem.scalar(), data.data_type()) {
-        (Some(Scalar::Real), DataType::Float64) => data
-            .as_primitive::<Float64Type>()
-            .values()
-            .iter()
-            .all(|&x| elem.contains_real(x)),
-        (Some(Scalar::Real), DataType::Float32) => data
-            .as_primitive::<Float32Type>()
-            .values()
-            .iter()
-            .all(|&x| elem.contains_real(x as f64)),
-        (Some(Scalar::Integer), DataType::Int64) => data
-            .as_primitive::<Int64Type>()
-            .values()
-            .iter()
-            .all(|&n| elem.contains_int(n)),
-        (Some(Scalar::Boolean), DataType::Boolean) => true,
-        _ => false,
-    };
-    if ok { Ok(()) } else { Err(()) }
+    match array.data_type() {
+        DataType::FixedSizeList(_, s) if *s as usize == size => {
+            Ok(array.as_fixed_size_list().values().clone())
+        }
+        DataType::List(_) => {
+            let list = array.as_list::<i32>();
+            let offsets = list.value_offsets();
+            if offsets.windows(2).any(|w| (w[1] - w[0]) as usize != size) {
+                return Err(wrong());
+            }
+            let first = offsets[0] as usize;
+            Ok(list.values().slice(first, array.len() * size))
+        }
+        DataType::LargeList(_) => {
+            let list = array.as_list::<i64>();
+            let offsets = list.value_offsets();
+            if offsets.windows(2).any(|w| (w[1] - w[0]) as usize != size) {
+                return Err(wrong());
+            }
+            let first = offsets[0] as usize;
+            Ok(list.values().slice(first, array.len() * size))
+        }
+        _ => Err(wrong()),
+    }
 }
 
 /// Encode a value in the part layout as an Arrow IPC stream.
@@ -565,5 +563,54 @@ mod tests {
         assert!(matches!(table, Value::Table(ref t) if t.len() == 2));
         let first = decode_part(&bytes, &record).unwrap();
         assert!(matches!(first, Value::Record(ref f) if f.len() == 2));
+    }
+
+    #[test]
+    fn an_array_of_vectors_is_not_a_matrix() {
+        let bytes = encode_part(&Value::Array {
+            shape: vec![2, 3],
+            data: reals(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+        })
+        .unwrap();
+        let vectors = Set::Pow(Box::new(Set::Pow(Box::new(Set::Reals), vec![3])), vec![2]);
+        let Value::Array { shape, data } = decode_part(&bytes, &vectors).unwrap() else {
+            panic!()
+        };
+        assert_eq!(shape, vec![2]);
+        assert_eq!(flatten(&data).0, vec![3]);
+        assert_eq!(
+            Value::Array { shape, data }.set().to_string(),
+            "cartpow(cartpow(reals, 3), 2)"
+        );
+        let matrix = decode_part(&bytes, &Set::Pow(Box::new(Set::Reals), vec![2, 3])).unwrap();
+        assert_eq!(matrix.shape(), Some(&[2, 3][..]));
+        let wrong = Set::Pow(Box::new(Set::Pow(Box::new(Set::Reals), vec![2])), vec![2]);
+        assert!(decode_part(&bytes, &wrong).is_err());
+    }
+
+    #[test]
+    fn conform_reads_lists_and_refuses_ragged_ones() {
+        use arrow_array::ListArray;
+        use arrow_buffer::OffsetBuffer;
+        let field = Arc::new(Field::new("item", DataType::Int64, false));
+        let list = |lengths: [usize; 2]| -> ArrayRef {
+            Arc::new(ListArray::new(
+                field.clone(),
+                OffsetBuffer::from_lengths(lengths),
+                Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
+                None,
+            ))
+        };
+        let set = Set::Pow(Box::new(Set::Reals), vec![2]);
+        let canonical = conform(&list([2, 2]), &set).unwrap();
+        assert_eq!(
+            canonical.data_type(),
+            &DataType::new_fixed_size_list(DataType::Float64, 2, false)
+        );
+        assert!(conform(&list([1, 3]), &set).is_err());
+        let ints = Set::Pow(Box::new(Set::PosIntegers), vec![2]);
+        assert!(conform(&list([2, 2]), &ints).is_ok());
+        let reals_in = conform(&reals(vec![1.0]), &Set::Integers);
+        assert!(reals_in.is_err(), "integers by type, not by value");
     }
 }

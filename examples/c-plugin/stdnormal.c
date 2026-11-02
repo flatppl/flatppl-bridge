@@ -7,8 +7,8 @@
 #include "flatppl_bridge.h"
 
 static const char* DESCRIBE =
-    "stdnormal = record(kind = \"measure\", queries = [\"builtin_logdensityof\"], "
-    "gradient = false, vjp = false, variate = reals, normalized = true)\n";
+    "{\"stdnormal\": {\"kind\": \"measure\", \"queries\": [\"builtin_logdensityof\"], "
+    "\"gradient\": false, \"vjp\": false, \"variate\": \"reals\", \"normalized\": true}}";
 
 static const char* describe(void* state) {
   (void)state;

@@ -128,7 +128,7 @@ async fn boxes(State(bridge): State<Arc<Bridge>>) -> Response {
 async fn describe(State(bridge): State<Arc<Bridge>>, Path(name): Path<String>) -> Response {
     match bridge.describe(&name) {
         Some(text) => (
-            [(header::CONTENT_TYPE, "text/x-flatppl; charset=utf-8")],
+            [(header::CONTENT_TYPE, "application/json")],
             text.to_owned(),
         )
             .into_response(),
