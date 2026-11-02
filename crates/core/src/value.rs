@@ -92,7 +92,8 @@ fn scalar_set(data_type: &DataType) -> Set {
     }
 }
 
-fn pow(elem: Set, shape: &[usize]) -> Set {
+/// `cartpow(elem, shape)`, or `elem` for an empty shape.
+pub fn pow(elem: Set, shape: &[usize]) -> Set {
     if shape.is_empty() {
         elem
     } else {
@@ -161,6 +162,8 @@ pub fn struct_array<'a>(
 }
 
 /// Decode `rows` elements of an Arrow array into a value of batch shape `batch`.
+/// With an empty batch, the one element is the value. Otherwise the value is
+/// the array of the elements, so an array element stays an element (spec §04).
 pub fn from_elements(array: &ArrayRef, batch: &[usize]) -> Result<Value, BridgeError> {
     let rows: usize = batch.iter().product();
     if array.len() != rows {
@@ -181,9 +184,13 @@ pub fn from_elements(array: &ArrayRef, batch: &[usize]) -> Result<Value, BridgeE
         _ => {
             let (dims, data) = flatten(array);
             let data = normalize(&data).map_err(BridgeError::Failure)?;
-            Ok(Value::Array {
-                shape: batch.iter().copied().chain(dims).collect(),
-                data,
+            Ok(if batch.is_empty() {
+                Value::Array { shape: dims, data }
+            } else {
+                Value::Array {
+                    shape: batch.to_vec(),
+                    data: nest(data, &dims),
+                }
             })
         }
     }
@@ -449,6 +456,12 @@ fn list_values(array: &ArrayRef, size: usize) -> Result<ArrayRef, String> {
 
 /// Encode a value in the part layout as an Arrow IPC stream.
 pub fn encode_part(value: &Value) -> Result<Vec<u8>, BridgeError> {
+    encode_part_as(value, &value.set())
+}
+
+/// Encode a value whose set is `set`. Arrow cannot tell an array of arrays from
+/// a multi-axis array, so the caller names the set where it knows it.
+pub fn encode_part_as(value: &Value, set: &Set) -> Result<Vec<u8>, BridgeError> {
     let (names, columns, rows): (Vec<String>, Vec<ArrayRef>, usize) = match value {
         Value::Array { shape, data } if shape.is_empty() => {
             (vec!["value".into()], vec![data.clone()], 1)
@@ -477,7 +490,7 @@ pub fn encode_part(value: &Value) -> Result<Vec<u8>, BridgeError> {
         .zip(&columns)
         .map(|(n, c)| Field::new(n, c.data_type().clone(), false))
         .collect();
-    let metadata = HashMap::from([(VALUESET_KEY.to_owned(), value.set().to_string())]);
+    let metadata = HashMap::from([(VALUESET_KEY.to_owned(), set.to_string())]);
     let schema = Arc::new(Schema::new_with_metadata(fields, metadata));
     let failure = |e: arrow_schema::ArrowError| BridgeError::Failure(format!("Arrow IPC: {e}"));
     let mut writer = StreamWriter::try_new(Vec::new(), &schema).map_err(failure)?;

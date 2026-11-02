@@ -80,7 +80,7 @@ Derivatives are per row:
 
 The server sums rows that share a source value, for example a scalar held constant in a broadcast. So the reply carries the derivative of the whole query.
 
-The server takes the result arrays and releases them. It then calls `release` once.
+The server takes the result arrays and releases them. It then calls `release` once. Each `value` element of `FPB_OP_APPLY` must lie in the declared `output` set, and each sampled variate in the `variate` set. Otherwise the query fails with 500.
 
 ## Status codes
 

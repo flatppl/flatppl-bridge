@@ -5,6 +5,8 @@
 //! - `halfnormal`: the standard normal measure with weight 1/2 (mass 1/2).
 //! - `stdnormal2`: the standard normal measure on `cartpow(reals, 2)`.
 //! - `square`: the elementwise square, with a VJP.
+//! - `pair`: the function `x -> [x, 2x]` from reals to 2-vectors.
+//! - `shifted2`: the kernel `mu -> mu + Normal(0, 1)^2` on 2-vectors, a sampler.
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::Float64Type;
@@ -19,6 +21,8 @@ const DESCRIBE: &str = r#"{
   "stdnormal": {"kind": "measure", "queries": ["builtin_logdensityof", "builtin_sample"], "gradient": true, "vjp": false, "variate": "reals", "normalized": true},
   "stdnormal2": {"kind": "measure", "queries": ["builtin_logdensityof"], "gradient": true, "vjp": false, "variate": "cartpow(reals, 2)", "normalized": true},
   "halfnormal": {"kind": "measure", "queries": ["builtin_logdensityof"], "gradient": false, "vjp": false, "variate": "reals", "normalized": false},
+  "pair": {"kind": "function", "queries": ["apply"], "input": "reals", "output": "cartpow(reals, 2)"},
+  "shifted2": {"kind": "kernel", "queries": ["builtin_sample"], "input": "cartpow(reals, 2)", "variate": "cartpow(reals, 2)", "normalized": true},
   "square": {"kind": "function", "queries": ["apply"], "gradient": false, "vjp": true, "input": "anything", "output": "anything"}
 }"#;
 
@@ -56,6 +60,12 @@ fn field(input: &Option<ArrayRef>, name: &str) -> Result<Vec<f64>, Error> {
 
 fn array(values: Vec<f64>) -> ArrayRef {
     Arc::new(Float64Array::from(values))
+}
+
+/// Real vectors of length `size`, one per `size` values.
+fn vectors(values: Vec<f64>, size: i32) -> ArrayRef {
+    let field = Arc::new(Field::new("item", DataType::Float64, false));
+    Arc::new(FixedSizeListArray::new(field, size, array(values), None))
 }
 
 fn lognormal(x: f64, mu: f64, sigma: f64) -> f64 {
@@ -288,6 +298,41 @@ impl Plugin for TestBox {
                     d_input: None,
                     d_point,
                     rng: Vec::new(),
+                })
+            }
+            ("pair", Op::Apply) => {
+                let x = reals(&call.input, "x")?;
+                let pairs = x.iter().flat_map(|&x| [x, 2.0 * x]).collect();
+                Ok(Output {
+                    value: vectors(pairs, 2),
+                    d_input: None,
+                    d_point: None,
+                    rng: Vec::new(),
+                })
+            }
+            ("shifted2", Op::Sample) => {
+                let mu = call
+                    .input
+                    .as_ref()
+                    .and_then(|i| i.as_fixed_size_list_opt())
+                    .ok_or_else(|| Error::Invalid("the input must be a 2-vector".into()))?;
+                let mu = reals(&Some(mu.values().clone()), "mu")?;
+                let count: u64 = call.sizes.iter().product();
+                let mut values = Vec::new();
+                let mut states = Vec::new();
+                for row in 0..call.rows {
+                    let mut rng = SplitMix::from(call.rng.get(row))?;
+                    for _ in 0..count {
+                        values.push(mu[2 * row] + rng.normal());
+                        values.push(mu[2 * row + 1] + rng.normal());
+                    }
+                    states.push(rng.state());
+                }
+                Ok(Output {
+                    value: vectors(values, 2),
+                    d_input: None,
+                    d_point: None,
+                    rng: states,
                 })
             }
             ("stdnormal", Op::Sample) => sample(&call, |rng, _| rng.normal()),

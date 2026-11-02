@@ -128,7 +128,7 @@ result = builtin_logdensityof(bb.K, theta, x)
 
 - `wrt` lists data or literal binding names of the query. The server returns one derivative per name.
 - `gradient` returns the gradient of the sum of all result entries. For a scalar result this is the ordinary gradient. For a broadcast it is the per-row gradient for a batched argument, and the sum over rows for a held-constant argument.
-- `vjp` returns the vector-Jacobian product with the cotangent. `cotangent` names a data binding of the query whose value has the shape of the result.
+- `vjp` returns the vector-Jacobian product with the cotangent. `cotangent` names a data binding of the query whose value has the shape of the result. For a result that is an array of arrays, the multi-axis array of the same entries is accepted too.
 - A derivative of `builtin_sample`, a derivative the member does not support, or a derivative with respect to an integer or boolean binding is refused with 422.
 
 ### RNG state
@@ -145,9 +145,13 @@ A successful query returns 200 with `multipart/mixed`. Each part is an Arrow IPC
 
 | Part name | When | Content |
 |---|---|---|
-| `value` | always | The result. For `builtin_sample`, the samples `X`. For a batched sample, the samples of each row, with the row axis first. |
+| `value` | always | The result. For `builtin_sample`, the samples `X`. |
 | `d_<name>` | for each `wrt` name | The derivative, with the shape of binding `<name>`. |
 | `rngstate` | for `builtin_sample` | The new RNG state: a vector of integers in `0..255`. For a batched sample, an array with one such vector per row. |
+
+The result of a `broadcast` is the array of the per-row results (spec §04). A result that is an array stays one element, so the reply is an array of arrays, encoded as nested `FixedSizeList`s. For example, a function from reals to `cartpow(reals, 2)` broadcast over 3 rows gives 3 vectors, in `cartpow(cartpow(reals, 2), 3)`. The samples `X` of `builtin_sample` with sizes `n, ...` are an array of that shape whose elements are variates (spec §06 `iid`). A batched sample is the array of the per-row `X`. A kernel with variate `cartpow(reals, 2)` gives `cartpow(cartpow(reals, 2), 3)` over 3 rows, and `cartpow(cartpow(cartpow(reals, 2), 4), 3)` with size 4.
+
+An array of arrays and a multi-axis array have the same Arrow type, so the `flatppl.valueset` metadata tells them apart. It uses the member's declared `output` or `variate` set, and the server refuses a box result outside that set with 500. For a member that declares `anything`, nested lists in a result read as a multi-axis array.
 
 Parts come in this order. The `value` part may stream in several record batches, so a client can read a large result before the reply ends.
 
