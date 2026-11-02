@@ -5,7 +5,7 @@ use crate::error::{BridgeError, bad, unsupported};
 use crate::exec::{self, Options};
 use crate::query::{self, Source};
 use crate::store::{ReplyCache, Store, sha256_hex};
-use crate::value::{Value, decode_part, encode_part};
+use crate::value::{Value, decode_part, encode_part_as};
 use flatppl_bridge_abi::Plugin;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -152,7 +152,7 @@ impl Bridge {
         let reply: Reply = Arc::new(
             parts
                 .iter()
-                .map(|(name, value)| Ok((name.clone(), encode_part(value)?)))
+                .map(|(name, value, set)| Ok((name.clone(), encode_part_as(value, set)?)))
                 .collect::<Result<_, BridgeError>>()?,
         );
         if let (Some(cache), Some(key)) = (&self.cache, key) {

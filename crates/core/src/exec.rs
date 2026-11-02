@@ -5,7 +5,7 @@ use crate::describe::{Kind, Member};
 use crate::error::{BridgeError, bad, unsupported};
 use crate::query::{Operand, Query, RngSpec, bytes_of};
 use crate::set::Set;
-use crate::value::{Value, conform, flatten, from_elements, nest, struct_array};
+use crate::value::{Value, conform, flatten, from_elements, nest, pow, struct_array};
 use arrow_array::cast::AsArray;
 use arrow_array::types::Float64Type;
 use arrow_array::{Array, ArrayRef, Float32Array, Float64Array, Int64Array, UInt64Array};
@@ -120,13 +120,14 @@ struct Occurrence {
 }
 
 /// Run `query` on `plugin`. `values` holds the data and literal bindings.
+/// Returns the reply parts, each with its value set.
 pub fn execute(
     query: &Query,
     members: &BTreeMap<String, Member>,
     values: &HashMap<String, Value>,
     options: &Options,
     plugin: &dyn Plugin,
-) -> Result<Vec<(String, Value)>, BridgeError> {
+) -> Result<Vec<(String, Value, Set)>, BridgeError> {
     let result = &query.result;
     let member = members.get(&result.member).ok_or_else(|| {
         unsupported(format!(
@@ -294,12 +295,43 @@ pub fn execute(
     } else {
         batch.clone()
     };
-    let value = from_elements(&output.value, &value_batch)?;
+    // A declared result set names the reply set, so the box must keep to it.
+    let declared = |set: &Option<Set>| set.clone().filter(|s| *s != Set::Anything);
+    let element = match result.op {
+        Op::Apply => declared(&member.output),
+        Op::Sample => declared(&member.variate),
+        _ => None,
+    };
+    if let Some(set) = &element {
+        conform(&output.value, set).map_err(|e| {
+            BridgeError::Failure(format!("the box returned a value outside `{set}`: {e}"))
+        })?;
+    }
+    let mut value = from_elements(&output.value, &value_batch)?;
+    // A batched sample is the array of the per-row samples (spec §04).
+    if result.op == Op::Sample
+        && !batch.is_empty()
+        && !sizes.is_empty()
+        && let Value::Array { shape, data } = value
+    {
+        value = Value::Array {
+            data: nest(data, &shape[batch.len()..]),
+            shape: batch.clone(),
+        };
+    }
+    let value_set = match element {
+        Some(set) if result.op == Op::Sample => {
+            let sizes: Vec<usize> = sizes.iter().map(|&n| n as usize).collect();
+            pow(pow(set, &sizes), &batch)
+        }
+        Some(set) => pow(set, &batch),
+        None => value.set(),
+    };
     let mut parts = Vec::new();
     if let Some(d) = &options.derivative {
         if d.vjp {
             let ct = &values[d.cotangent.as_ref().expect("checked")];
-            if ct.shape() != value.shape() {
+            if full_shape(ct) != full_shape(&value) {
                 return Err(bad("the cotangent does not have the shape of the result"));
             }
         } else if !matches!(&value, Value::Array { data, .. } if is_real(data.data_type()))
@@ -310,13 +342,13 @@ pub fn execute(
             ));
         }
     }
-    let real32 =
-        matches!(&value, Value::Array { data, .. } if data.data_type() == &DataType::Float32);
-    parts.push(("value".to_owned(), value));
+    let real32 = matches!(&value, Value::Array { data, .. } if flatten(data).1.data_type() == &DataType::Float32);
+    parts.push(("value".to_owned(), value, value_set));
     if let Some(d) = &options.derivative {
         for name in &d.wrt {
             let derivative = accumulate(name, &values[name], &occurrences, &output, rows, real32)?;
-            parts.push((format!("d_{name}"), derivative));
+            let set = derivative.set();
+            parts.push((format!("d_{name}"), derivative, set));
         }
     }
     if result.op == Op::Sample {
@@ -346,9 +378,21 @@ pub fn execute(
                 data,
             }
         };
-        parts.push(("rngstate".to_owned(), value));
+        let set = value.set();
+        parts.push(("rngstate".to_owned(), value, set));
     }
     Ok(parts)
+}
+
+/// The shape of a value with its element arrays as trailing axes. A cotangent
+/// may give an array of arrays as a multi-axis array: Arrow encodes both alike.
+fn full_shape(value: &Value) -> Option<Vec<usize>> {
+    match value {
+        Value::Array { shape, data } => {
+            Some(shape.iter().copied().chain(flatten(data).0).collect())
+        }
+        _ => None,
+    }
 }
 
 /// Check the elements of a slot against the member's declared set.

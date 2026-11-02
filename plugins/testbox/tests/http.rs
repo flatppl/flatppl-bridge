@@ -592,7 +592,7 @@ fn batched_sampling_equals_unbatched_draws_per_row() {
         &[("t", t.clone())],
     );
     let value = batched.reals("value");
-    assert_eq!(batched.valueset("value"), "cartpow(reals, [3, 4])");
+    assert_eq!(batched.valueset("value"), "cartpow(cartpow(reals, 4), 3)");
     let states = batched.int_rows("rngstate");
     assert_eq!(states.len(), 3);
     let rows = [(11, 0.0, 1.0), (12, 10.0, 0.1), (13, -5.0, 2.0)];
@@ -638,7 +638,7 @@ fn batched_sampling_equals_unbatched_draws_per_row() {
         &[],
     );
     let value = batched.reals("value");
-    assert_eq!(batched.valueset("value"), "cartpow(reals, [2, 3])");
+    assert_eq!(batched.valueset("value"), "cartpow(cartpow(reals, 3), 2)");
     for (i, seed) in ["[1, 2]", "[3, 4]"].into_iter().enumerate() {
         let one = server.query(
             &format!("{HEAD}result = builtin_sample(rnginit({seed}), tb.stdnormal, 3)\n"),
@@ -789,4 +789,70 @@ fn the_core_checks_arguments_against_declared_sets() {
     // An integer is a real (spec §03).
     let r = query("result = builtin_logdensityof(tb.stdnormal, 1)\n");
     assert!(close(r.reals("value")[0], -1.4189385332046727));
+}
+
+#[test]
+fn a_broadcast_of_vector_results_is_an_array_of_vectors() {
+    let server = start(None);
+    let r = server.query(
+        &format!("{HEAD}result = tb.pair.([1.0, 2.0, 3.0])\n"),
+        None,
+        &[],
+    );
+    assert_eq!(r.valueset("value"), "cartpow(cartpow(reals, 2), 3)");
+    assert_eq!(r.part("value").num_rows(), 3);
+    assert_eq!(r.reals("value"), vec![1.0, 2.0, 2.0, 4.0, 3.0, 6.0]);
+    // One call is the vector itself.
+    let r = server.query(&format!("{HEAD}result = tb.pair(1.0)\n"), None, &[]);
+    assert_eq!(r.valueset("value"), "cartpow(reals, 2)");
+}
+
+#[test]
+fn batched_sampling_of_a_vector_kernel_gives_one_vector_per_row() {
+    let server = start(None);
+    let mus = "[[0.0, 1.0], [10.0, 20.0], [-5.0, 5.0]]";
+    let batched = server.query(
+        &format!(
+            "{HEAD}result = broadcast(builtin_sample, rnginit.([1, 2, 3]), tb.shifted2, {mus})\n"
+        ),
+        None,
+        &[],
+    );
+    assert_eq!(batched.valueset("value"), "cartpow(cartpow(reals, 2), 3)");
+    assert_eq!(batched.part("value").num_rows(), 3);
+    let value = batched.reals("value");
+    for (row, mu) in ["[0.0, 1.0]", "[10.0, 20.0]", "[-5.0, 5.0]"]
+        .into_iter()
+        .enumerate()
+    {
+        let one = server.query(
+            &format!(
+                "{HEAD}result = builtin_sample(rnginit({}), tb.shifted2, {mu})\n",
+                row + 1
+            ),
+            None,
+            &[],
+        );
+        assert_eq!(one.valueset("value"), "cartpow(reals, 2)");
+        assert_eq!(one.reals("value"), value[2 * row..][..2]);
+    }
+    // With sizes, each row is an array of 4 vectors (spec §06 iid).
+    let batched = server.query(
+        &format!(
+            "{HEAD}result = broadcast(builtin_sample, rnginit.([1, 2, 3]), tb.shifted2, {mus}, 4)\n"
+        ),
+        None,
+        &[],
+    );
+    assert_eq!(
+        batched.valueset("value"),
+        "cartpow(cartpow(cartpow(reals, 2), 4), 3)"
+    );
+    let one = server.query(
+        &format!("{HEAD}result = builtin_sample(rnginit(2), tb.shifted2, [10.0, 20.0], 4)\n"),
+        None,
+        &[],
+    );
+    assert_eq!(one.valueset("value"), "cartpow(cartpow(reals, 2), 4)");
+    assert_eq!(one.reals("value"), batched.reals("value")[8..16]);
 }
