@@ -111,11 +111,23 @@ impl Plugin for CPlugin {
         let mut cotangent = export(&call.derivative.as_ref().and_then(|d| d.cotangent.clone()))?;
         let member = CString::new(call.member.as_str())
             .map_err(|_| Error::Invalid("member name has a NUL".into()))?;
-        let (rng_kind, rng): (u32, &[u8]) = match &call.rng {
-            None => (RNG_NONE, &[]),
-            Some(Rng::Seed(b)) => (RNG_SEED, b),
-            Some(Rng::State(b)) => (RNG_STATE, b),
-        };
+        let mut rng_kind = RNG_NONE;
+        let mut rng_len = 0;
+        let mut rng = Vec::new();
+        for (row, state) in call.rng.iter().enumerate() {
+            let (kind, bytes) = match state {
+                Rng::Seed(b) => (RNG_SEED, b),
+                Rng::State(b) => (RNG_STATE, b),
+            };
+            if row == 0 {
+                (rng_kind, rng_len) = (kind, bytes.len());
+            } else if kind != rng_kind || bytes.len() != rng_len {
+                return Err(Error::Invalid(
+                    "the rows of a sample need RNG states of one kind and length".into(),
+                ));
+            }
+            rng.extend_from_slice(bytes);
+        }
         let (deriv, wrt) = match &call.derivative {
             None => (DERIV_NONE, 0),
             Some(d) => (
@@ -142,7 +154,7 @@ impl Plugin for CPlugin {
             n_sizes: call.sizes.len(),
             rng_kind,
             rng: rng.as_ptr(),
-            rng_len: rng.len(),
+            rng_len,
             deriv,
             wrt,
             cotangent: ptr(&mut cotangent),
@@ -156,10 +168,15 @@ impl Plugin for CPlugin {
             let value = take(&mut out.value);
             let d_input = take(&mut out.d_input);
             let d_point = take(&mut out.d_point);
-            let rng = (!out.rng.is_null()).then(|| {
-                // SAFETY: the plugin set `rng_len` bytes at `rng`, valid until release.
-                unsafe { std::slice::from_raw_parts(out.rng, out.rng_len) }.to_vec()
-            });
+            let rng = if out.rng.is_null() || out.rng_len == 0 {
+                Vec::new()
+            } else {
+                // SAFETY: the plugin set `rows` states of `rng_len` bytes at `rng`, valid until release.
+                unsafe { std::slice::from_raw_parts(out.rng, call.rows * out.rng_len) }
+                    .chunks(out.rng_len)
+                    .map(<[u8]>::to_vec)
+                    .collect()
+            };
             (|| {
                 Ok(Output {
                     value: value?

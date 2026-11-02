@@ -90,7 +90,7 @@ impl Op {
     }
 }
 
-/// The RNG state of a sampling call.
+/// The RNG state of one row of a sampling call.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Rng {
     /// A fresh state from these seed bytes (`rnginit`).
@@ -117,18 +117,21 @@ pub struct Call {
     pub input: Option<ArrayRef>,
     pub point: Option<ArrayRef>,
     pub sizes: Vec<u64>,
-    pub rng: Option<Rng>,
+    /// One RNG state per row for [`Op::Sample`], empty otherwise. Every row
+    /// has the same kind and byte length.
+    pub rng: Vec<Rng>,
     pub derivative: Option<Derivative>,
 }
 
 /// The result of a call.
 #[derive(Clone, Debug)]
 pub struct Output {
-    /// `rows` values, or the product of the sample sizes for a sample.
+    /// `rows` values, or for a sample `rows` times the product of the sizes.
     pub value: ArrayRef,
     pub d_input: Option<ArrayRef>,
     pub d_point: Option<ArrayRef>,
-    pub rng: Option<Vec<u8>>,
+    /// For a sample, the new RNG state of each row, all of one byte length.
+    pub rng: Vec<Vec<u8>>,
 }
 
 /// A call failure, by HTTP class.
@@ -176,7 +179,7 @@ impl std::error::Error for Error {}
 
 /// A box implementation. Calls may arrive from several threads at once.
 pub trait Plugin: Send + Sync {
-    /// The describe text: one FlatPPL record binding per member.
+    /// The describe JSON of `docs/protocol.md`: one member object per member.
     fn describe(&self) -> Result<String, Error>;
     fn call(&self, call: Call) -> Result<Output, Error>;
 }
@@ -301,17 +304,21 @@ pub unsafe fn decode_call(call: *const FpbCall) -> Result<Call, Error> {
             .to_str()
             .map_err(|_| Error::Invalid("member name is not UTF-8".into()))?
             .to_owned();
-        let slice = |ptr: *const u8, len: usize| {
-            if len == 0 {
-                Vec::new()
-            } else {
-                std::slice::from_raw_parts(ptr, len).to_vec()
+        let rows =
+            usize::try_from(call.rows).map_err(|_| Error::Invalid("negative rows".into()))?;
+        let states = || -> Vec<Vec<u8>> {
+            if call.rng_len == 0 {
+                return vec![Vec::new(); rows];
             }
+            std::slice::from_raw_parts(call.rng, rows * call.rng_len)
+                .chunks(call.rng_len)
+                .map(<[u8]>::to_vec)
+                .collect()
         };
         let rng = match call.rng_kind {
-            RNG_SEED => Some(Rng::Seed(slice(call.rng, call.rng_len))),
-            RNG_STATE => Some(Rng::State(slice(call.rng, call.rng_len))),
-            _ => None,
+            RNG_SEED => states().into_iter().map(Rng::Seed).collect(),
+            RNG_STATE => states().into_iter().map(Rng::State).collect(),
+            _ => Vec::new(),
         };
         let sizes = if call.n_sizes == 0 {
             Vec::new()
@@ -338,7 +345,7 @@ pub unsafe fn decode_call(call: *const FpbCall) -> Result<Call, Error> {
         Ok(Call {
             op,
             member,
-            rows: usize::try_from(call.rows).map_err(|_| Error::Invalid("negative rows".into()))?,
+            rows,
             input: FpbArray::take(call.input)?,
             point: FpbArray::take(call.point)?,
             sizes,
@@ -403,13 +410,21 @@ pub mod export {
             ))
         }) {
             Ok((value, d_input, d_point, rng)) => {
+                let len = rng.first().map_or(0, Vec::len);
+                if rng.iter().any(|r| r.len() != len) {
+                    let text = message("the plugin returned RNG states of different lengths");
+                    out.error = text.as_ptr() as *mut c_char;
+                    owned.error = Some(text);
+                    out.private_data = Box::into_raw(owned) as *mut c_void;
+                    return FAILURE;
+                }
                 out.value = value;
                 out.d_input = d_input;
                 out.d_point = d_point;
-                if let Some(rng) = rng {
-                    owned.rng = rng;
+                if !rng.is_empty() {
+                    owned.rng = rng.concat();
                     out.rng = owned.rng.as_mut_ptr();
-                    out.rng_len = owned.rng.len();
+                    out.rng_len = len;
                 }
                 OK
             }

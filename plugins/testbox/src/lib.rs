@@ -3,6 +3,7 @@
 //! - `normal`: the kernel `(mu, sigma) -> Normal(mu, sigma)`.
 //! - `stdnormal`: the standard normal measure.
 //! - `halfnormal`: the standard normal measure with weight 1/2 (mass 1/2).
+//! - `stdnormal2`: the standard normal measure on `cartpow(reals, 2)`.
 //! - `square`: the elementwise square, with a VJP.
 
 use arrow_array::cast::AsArray;
@@ -13,11 +14,13 @@ use flatppl_bridge_abi::{Call, Error, Op, Output, Plugin, Rng};
 use std::f64::consts::PI;
 use std::sync::Arc;
 
-const DESCRIBE: &str = r#"normal = record(kind = "kernel", queries = ["builtin_logdensityof", "builtin_sample", "builtin_touniform"], gradient = true, vjp = false, input = cartprod(mu = reals, sigma = posreals), variate = reals, normalized = true)
-stdnormal = record(kind = "measure", queries = ["builtin_logdensityof", "builtin_sample"], gradient = true, vjp = false, variate = reals, normalized = true)
-halfnormal = record(kind = "measure", queries = ["builtin_logdensityof"], gradient = false, vjp = false, variate = reals, normalized = false)
-square = record(kind = "function", queries = ["apply"], gradient = false, vjp = true, input = anything, output = anything)
-"#;
+const DESCRIBE: &str = r#"{
+  "normal": {"kind": "kernel", "queries": ["builtin_logdensityof", "builtin_sample", "builtin_touniform"], "gradient": true, "vjp": false, "input": "cartprod(mu = reals, sigma = posreals)", "variate": "reals", "normalized": true},
+  "stdnormal": {"kind": "measure", "queries": ["builtin_logdensityof", "builtin_sample"], "gradient": true, "vjp": false, "variate": "reals", "normalized": true},
+  "stdnormal2": {"kind": "measure", "queries": ["builtin_logdensityof"], "gradient": true, "vjp": false, "variate": "cartpow(reals, 2)", "normalized": true},
+  "halfnormal": {"kind": "measure", "queries": ["builtin_logdensityof"], "gradient": false, "vjp": false, "variate": "reals", "normalized": false},
+  "square": {"kind": "function", "queries": ["apply"], "gradient": false, "vjp": true, "input": "anything", "output": "anything"}
+}"#;
 
 const RNG_TAG: &[u8] = b"FPBT1";
 
@@ -64,7 +67,7 @@ fn lognormal(x: f64, mu: f64, sigma: f64) -> f64 {
 struct SplitMix(u64);
 
 impl SplitMix {
-    fn from(rng: &Option<Rng>) -> Result<SplitMix, Error> {
+    fn from(rng: Option<&Rng>) -> Result<SplitMix, Error> {
         match rng {
             Some(Rng::Seed(bytes)) => {
                 let seed = bytes.iter().fold(0x9e37_79b9_7f4a_7c15u64, |h, &b| {
@@ -110,15 +113,21 @@ impl SplitMix {
     }
 }
 
-fn sample(call: &Call, draw: impl Fn(&mut SplitMix) -> f64) -> Result<Output, Error> {
-    let mut rng = SplitMix::from(&call.rng)?;
+/// Draw `rows` independent samples, row `i` with RNG state `i`.
+fn sample(call: &Call, draw: impl Fn(&mut SplitMix, usize) -> f64) -> Result<Output, Error> {
     let count: u64 = call.sizes.iter().product();
-    let values = (0..count).map(|_| draw(&mut rng)).collect();
+    let mut values = Vec::new();
+    let mut states = Vec::new();
+    for row in 0..call.rows {
+        let mut rng = SplitMix::from(call.rng.get(row))?;
+        values.extend((0..count).map(|_| draw(&mut rng, row)));
+        states.push(rng.state());
+    }
     Ok(Output {
         value: array(values),
         d_input: None,
         d_point: None,
-        rng: Some(rng.state()),
+        rng: states,
     })
 }
 
@@ -210,7 +219,7 @@ impl Plugin for TestBox {
                     value: array(value),
                     d_input,
                     d_point,
-                    rng: None,
+                    rng: Vec::new(),
                 })
             }
             ("normal", Op::ToUniform) => {
@@ -228,15 +237,12 @@ impl Plugin for TestBox {
                     value: array(value),
                     d_input: None,
                     d_point: None,
-                    rng: None,
+                    rng: Vec::new(),
                 })
             }
             ("normal", Op::Sample) => {
-                let (mu, sigma) = (
-                    field(&call.input, "mu")?[0],
-                    field(&call.input, "sigma")?[0],
-                );
-                sample(&call, |rng| mu + sigma * rng.normal())
+                let (mu, sigma) = (field(&call.input, "mu")?, field(&call.input, "sigma")?);
+                sample(&call, |rng, row| mu[row] + sigma[row] * rng.normal())
             }
             ("stdnormal" | "halfnormal", Op::LogDensity) => {
                 let x = reals(&call.point, "x")?;
@@ -253,10 +259,38 @@ impl Plugin for TestBox {
                     value: array(value),
                     d_input: None,
                     d_point,
-                    rng: None,
+                    rng: Vec::new(),
                 })
             }
-            ("stdnormal", Op::Sample) => sample(&call, |rng| rng.normal()),
+            ("stdnormal2", Op::LogDensity) => {
+                // The core checked the point set, so each row is a 2-vector.
+                let point = call
+                    .point
+                    .as_ref()
+                    .and_then(|p| p.as_fixed_size_list_opt())
+                    .ok_or_else(|| Error::Invalid("the point must be a 2-vector".into()))?;
+                let x = reals(&Some(point.values().clone()), "x")?;
+                let value = x
+                    .chunks(2)
+                    .map(|v| lognormal(v[0], 0.0, 1.0) + lognormal(v[1], 0.0, 1.0))
+                    .collect();
+                let d_point = gradient.filter(|d| d.wrt_point).map(|_| {
+                    let field = Arc::new(Field::new("item", DataType::Float64, false));
+                    Arc::new(FixedSizeListArray::new(
+                        field,
+                        2,
+                        array(x.iter().map(|&x| -x).collect()),
+                        None,
+                    )) as ArrayRef
+                });
+                Ok(Output {
+                    value: array(value),
+                    d_input: None,
+                    d_point,
+                    rng: Vec::new(),
+                })
+            }
+            ("stdnormal", Op::Sample) => sample(&call, |rng, _| rng.normal()),
             ("square", Op::Apply) => {
                 let input = call
                     .input
@@ -277,7 +311,7 @@ impl Plugin for TestBox {
                     value,
                     d_input,
                     d_point: None,
-                    rng: None,
+                    rng: Vec::new(),
                 })
             }
             (member, op) => Err(Error::Unsupported(format!(

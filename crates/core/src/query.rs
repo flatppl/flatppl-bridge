@@ -3,7 +3,7 @@
 use crate::error::{BridgeError, bad, unsupported};
 use crate::set::Set;
 use crate::syntax::{builtin_head, literal_f64, literal_int, show};
-use crate::value::Value;
+use crate::value::{Value, flatten, nest};
 use arrow_array::{ArrayRef, BooleanArray, Float64Array, Int64Array};
 use flatppl_bridge_abi::Op;
 use flatppl_core::{CallHead, Module, NamedKind, Node, NodeId, RefNs, Scalar};
@@ -23,6 +23,10 @@ pub enum RngSpec {
     Seed(Vec<u8>),
     /// Bytes from a literal or a data binding.
     State(Operand),
+    /// `broadcast(rnginit, seeds)`: one state per entry of `seeds`.
+    Seeds(Operand),
+    /// `broadcast(rngstate, states)`: one state per byte vector of `states`.
+    States(Operand),
 }
 
 /// An argument of the result call.
@@ -88,6 +92,10 @@ pub fn parse(text: &str) -> Result<Query, BridgeError> {
             result = Some(rhs);
             continue;
         }
+        if rng_head(&module, rhs).is_some() {
+            rngs.insert(name, rng_spec(&module, rhs)?);
+            continue;
+        }
         match builtin_head(&module, rhs) {
             Some("load_module") => {
                 let source = string_arg(&module, rhs, "load_module")?;
@@ -114,9 +122,6 @@ pub fn parse(text: &str) -> Result<Query, BridgeError> {
                     _ => return Err(bad("the `load_data` source must be a string literal")),
                 };
                 data.insert(name, (source, Set::from_node(&module, *set)?));
-            }
-            Some("rnginit" | "rngstate") => {
-                rngs.insert(name, rng_spec(&module, rhs)?);
             }
             _ => match literal_value(&module, rhs) {
                 Some(value) => {
@@ -191,15 +196,49 @@ fn string_arg(module: &Module, id: NodeId, head: &str) -> Result<String, BridgeE
     }
 }
 
+/// `rnginit` or `rngstate`, called directly or through `broadcast` (then with a
+/// trailing `.`).
+fn rng_head(module: &Module, id: NodeId) -> Option<&'static str> {
+    let Node::Call(call) = module.node(id) else {
+        return None;
+    };
+    let name = |sym| match module.resolve(sym) {
+        "rnginit" => Some("rnginit"),
+        "rngstate" => Some("rngstate"),
+        _ => None,
+    };
+    match builtin_head(module, id)? {
+        "broadcast" => match call.args.first().map(|&c| module.node(c)) {
+            Some(Node::Const(sym)) => name(*sym).map(|n| {
+                if n == "rnginit" {
+                    "rnginit."
+                } else {
+                    "rngstate."
+                }
+            }),
+            _ => None,
+        },
+        _ => match call.head {
+            CallHead::Builtin(head) => name(head),
+            CallHead::User(_) => None,
+        },
+    }
+}
+
 fn rng_spec(module: &Module, id: NodeId) -> Result<RngSpec, BridgeError> {
     let Node::Call(call) = module.node(id) else {
         unreachable!()
     };
-    let [arg] = (call.args.len() == 1 && call.named.is_empty())
-        .then(|| [call.args[0]])
+    let head = rng_head(module, id).expect("an RNG expression");
+    let args = match head {
+        "rnginit." | "rngstate." => &call.args[1..],
+        _ => &call.args[..],
+    };
+    let [arg] = (args.len() == 1 && call.named.is_empty())
+        .then(|| [args[0]])
         .ok_or_else(|| bad(format!("`{}` takes one argument", show(module, id))))?;
-    match builtin_head(module, id) {
-        Some("rnginit") => {
+    match head {
+        "rnginit" => {
             if let Some(n) = literal_int(module, arg) {
                 let n = u64::try_from(n).map_err(|_| bad("an integer seed lies in 0..2^64-1"))?;
                 return Ok(RngSpec::Seed(n.to_le_bytes().to_vec()));
@@ -212,6 +251,8 @@ fn rng_spec(module: &Module, id: NodeId) -> Result<RngSpec, BridgeError> {
                 )),
             }
         }
+        "rnginit." => Ok(RngSpec::Seeds(operand(module, arg)?)),
+        "rngstate." => Ok(RngSpec::States(operand(module, arg)?)),
         _ => Ok(RngSpec::State(operand(module, arg)?)),
     }
 }
@@ -315,9 +356,19 @@ fn result_call(
                 if let Node::Const(sym) = module.node(*callee)
                     && module.resolve(*sym) == "builtin_sample"
                 {
-                    return Err(unsupported(
-                        "`builtin_sample` is not batched: a shared RNG state would correlate the rows",
-                    ));
+                    let ([rng, member, rest @ ..], true) = (rest, call.named.is_empty()) else {
+                        return Err(outside());
+                    };
+                    let member = member_of(*member).ok_or_else(outside)?;
+                    let mut args = vec![operand(module, *rng)?];
+                    args.extend(operands(rest)?);
+                    return Ok(ResultCall {
+                        op: Op::Sample,
+                        member,
+                        broadcast: true,
+                        args,
+                        kwargs: Vec::new(),
+                    });
                 }
                 let (Some(op), [member, rest @ ..], true) = (op, rest, call.named.is_empty())
                 else {
@@ -354,6 +405,9 @@ fn operand(module: &Module, id: NodeId) -> Result<Operand, BridgeError> {
     if let Some(value) = literal_value(module, id) {
         return Ok(Operand::Literal(value));
     }
+    if rng_head(module, id).is_some() {
+        return Ok(Operand::Rng(Box::new(rng_spec(module, id)?)));
+    }
     match module.node(id) {
         Node::Ref(r) if r.ns == RefNs::SelfMod => {
             Ok(Operand::Binding(module.resolve(r.name).to_owned()))
@@ -370,7 +424,6 @@ fn operand(module: &Module, id: NodeId) -> Result<Operand, BridgeError> {
                 .map(|a| Ok((module.resolve(a.name).to_owned(), operand(module, a.value)?)))
                 .collect::<Result<Vec<_>, _>>()
                 .map(Operand::Record),
-            Some("rnginit" | "rngstate") => Ok(Operand::Rng(Box::new(rng_spec(module, id)?))),
             _ => Err(unsupported(format!(
                 "argument `{}` is outside the black-box query profile",
                 show(module, id)
@@ -383,7 +436,8 @@ fn operand(module: &Module, id: NodeId) -> Result<Operand, BridgeError> {
     }
 }
 
-/// A literal scalar, an array literal of scalars, or a record literal of these.
+/// A literal scalar, an array literal of these or of array literals, or a
+/// record literal of these.
 pub fn literal_value(module: &Module, id: NodeId) -> Option<Value> {
     let scalar = |array: ArrayRef| Some(Value::scalar(array));
     match module.node(id) {
@@ -425,9 +479,10 @@ pub fn literal_value(module: &Module, id: NodeId) -> Option<Value> {
     }
 }
 
-/// Stack equal-shape array values along a new first axis.
+/// The array whose elements are `items`: equal-shape scalars or arrays.
+/// An array of arrays is not a matrix (spec §03).
 fn stack(items: &[Value]) -> Option<Value> {
-    let first = items.first()?.shape()?.to_vec();
+    let mut dims = None;
     let mut ints = Vec::new();
     let mut reals = Vec::new();
     let mut bools = Vec::new();
@@ -437,7 +492,9 @@ fn stack(items: &[Value]) -> Option<Value> {
         let Value::Array { shape, data } = item else {
             return None;
         };
-        if *shape != first {
+        let (inner, data) = flatten(data);
+        let full: Vec<usize> = shape.iter().copied().chain(inner).collect();
+        if *dims.get_or_insert_with(|| full.clone()) != full {
             return None;
         }
         if let Some(a) = data.as_any().downcast_ref::<Int64Array>() {
@@ -463,8 +520,10 @@ fn stack(items: &[Value]) -> Option<Value> {
     } else {
         return None;
     };
-    let shape = std::iter::once(items.len()).chain(first).collect();
-    Some(Value::Array { shape, data })
+    Some(Value::Array {
+        shape: vec![items.len()],
+        data: nest(data, &dims?),
+    })
 }
 
 #[cfg(test)]
@@ -524,11 +583,35 @@ mod tests {
             ),
             422
         );
-        assert_eq!(
-            status(
-                "bb = load_module(\"box:b\")\nresult = broadcast(builtin_sample, rnginit(1), bb.M, [1, 2])\n"
-            ),
-            422
+    }
+
+    #[test]
+    fn batched_sampling_and_rng_arrays() {
+        let q = parse(
+            "bb = load_module(\"box:b\")\n\
+             rngs = rnginit.([1, 2])\n\
+             result = broadcast(builtin_sample, rngs, bb.K, [0.0, 1.0], 3)\n",
+        )
+        .unwrap();
+        assert!(q.result.broadcast && q.result.op == Op::Sample);
+        assert!(matches!(q.rngs["rngs"], RngSpec::Seeds(_)));
+        let q = parse(
+            "bb = load_module(\"box:b\")\n\
+             s = load_data(\"part:s\", cartpow(cartpow(integers, 4), 2))\n\
+             result = broadcast(builtin_sample, broadcast(rngstate, s), bb.M)\n",
+        )
+        .unwrap();
+        assert!(
+            matches!(&q.result.args[0], Operand::Rng(spec) if matches!(**spec, RngSpec::States(_)))
         );
+    }
+
+    #[test]
+    fn a_nested_literal_is_an_array_of_arrays() {
+        let module = flatppl_syntax::parse("x = [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]]\n").unwrap();
+        let (_, binding) = module.bindings().next().unwrap();
+        let value = literal_value(&module, binding.rhs).unwrap();
+        assert_eq!(value.shape(), Some(&[3][..]));
+        assert_eq!(value.set().to_string(), "cartpow(cartpow(reals, 2), 3)");
     }
 }

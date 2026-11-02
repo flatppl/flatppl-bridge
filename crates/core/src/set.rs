@@ -100,14 +100,9 @@ impl Set {
                             }
                             _ => vec![dim(module, *size)?],
                         };
-                        let elem = Set::from_node(module, *elem)?;
-                        Ok(match elem {
-                            // cartpow(cartpow(S, a), b) has shape [b, a].
-                            Set::Pow(inner, inner_dims) if inner.scalar().is_some() => {
-                                Set::Pow(inner, dims.into_iter().chain(inner_dims).collect())
-                            }
-                            elem => Set::Pow(Box::new(elem), dims),
-                        })
+                        // cartpow(cartpow(S, a), b) is an array of arrays, not a
+                        // matrix (spec §03).
+                        Ok(Set::Pow(Box::new(Set::from_node(module, *elem)?), dims))
                     }
                     ("cartprod", [], named) if !named.is_empty() => named
                         .iter()

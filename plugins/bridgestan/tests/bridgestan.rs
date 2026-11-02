@@ -178,15 +178,36 @@ fn constrain_applies_the_transform() {
 
 #[test]
 #[ignore = "needs compiled BridgeStan models"]
-fn broadcast_over_scalar_points() {
+fn broadcast_over_a_batch_of_theta_vectors() {
+    let bridge = bridge("normal");
+    let thetas = [0.3, 0.2, -1.0, 0.5, 2.0, -0.7];
+    let text = "thetas = load_data(\"part:thetas\", cartpow(cartpow(reals, 2), 3))\nresult = builtin_logdensityof.(stan.posterior, thetas)\n";
+    let options = r#"{"derivative": {"kind": "gradient", "wrt": ["thetas"]}}"#;
+    let reply = query(
+        &bridge,
+        text,
+        Some(options),
+        vec![("thetas", part(vec![3, 2], thetas.to_vec()))],
+    );
+    assert_eq!(reply["value"].len(), 3);
+    for (row, theta) in thetas.chunks(2).enumerate() {
+        let (value, grad) = direct("normal", theta);
+        assert_eq!(reply["value"][row], value);
+        assert_eq!(reply["d_thetas"][2 * row..][..2], grad);
+    }
+}
+
+#[test]
+#[ignore = "needs compiled BridgeStan models"]
+fn broadcast_over_one_parameter_vectors() {
     let bridge = bridge("scalar");
-    let text = "us = load_data(\"part:us\", cartpow(reals, 3))\nresult = builtin_logdensityof.(stan.posterior, us)\n";
+    let text = "us = load_data(\"part:us\", cartpow(cartpow(reals, 1), 3))\nresult = builtin_logdensityof.(stan.posterior, us)\n";
     let options = r#"{"derivative": {"kind": "gradient", "wrt": ["us"]}}"#;
     let reply = query(
         &bridge,
         text,
         Some(options),
-        vec![("us", part(vec![3], vec![-1.0, 0.0, 1.0]))],
+        vec![("us", part(vec![3, 1], vec![-1.0, 0.0, 1.0]))],
     );
     // expon.logpdf(exp(u), scale = 0.5) + u, and its derivative 1 - 2 exp(u).
     let value = [-1.0426117017829393, -1.3068528194400546, -3.743416476358145];
@@ -214,4 +235,11 @@ fn refusals() {
         status("result = builtin_sample(rnginit(1), stan.posterior)\n"),
         422
     );
+    // A matrix broadcasts to scalars, which are not points of the posterior.
+    let request = Request {
+        query: "stan = load_module(\"box:stan\")\nthetas = load_data(\"part:thetas\", cartpow(reals, [3, 2]))\nresult = builtin_logdensityof.(stan.posterior, thetas)\n".into(),
+        parts: [("thetas".to_owned(), part(vec![3, 2], vec![0.0; 6]))].into(),
+        ..Request::default()
+    };
+    assert_eq!(bridge.query(&request).unwrap_err().status(), 400);
 }

@@ -3,11 +3,12 @@
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Float64Type, Int64Type};
-use arrow_array::{ArrayRef, Float64Array, RecordBatch};
+use arrow_array::{Array, ArrayRef, Float64Array, Int64Array, ListArray, RecordBatch};
+use arrow_schema::{Field, Schema};
 use flatppl_bridge::Bridge;
 use flatppl_bridge::server::Config;
 use flatppl_bridge::store::{Store, sha256_hex};
-use flatppl_bridge::value::{Value, encode_part, struct_array};
+use flatppl_bridge::value::{Value, encode_part, flatten, nest, struct_array};
 use reqwest::blocking::{Client, multipart};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -93,8 +94,8 @@ struct Reply {
 }
 
 impl Reply {
-    fn json(&self) -> serde_json_lite::Json {
-        serde_json_lite::parse(&self.body)
+    fn json(&self) -> serde_json::Value {
+        serde_json::from_slice(&self.body).unwrap()
     }
 
     /// The named parts of a multipart/mixed reply.
@@ -142,9 +143,24 @@ impl Reply {
 
     fn reals(&self, name: &str) -> Vec<f64> {
         let batch = self.part(name);
-        let column = batch.column(0).clone();
-        let (_, flat) = flatppl_bridge::value::flatten(&column);
+        let (_, flat) = flatten(batch.column(0));
         flat.as_primitive::<Float64Type>().values().to_vec()
+    }
+
+    /// An integer part, one vector per row (a single vector is one row).
+    fn int_rows(&self, name: &str) -> Vec<Vec<i64>> {
+        let batch = self.part(name);
+        let (dims, flat) = flatten(batch.column(0));
+        let flat = flat.as_primitive::<Int64Type>().values().to_vec();
+        match dims[..] {
+            [] => vec![flat],
+            [len] => flat.chunks(len).map(<[i64]>::to_vec).collect(),
+            _ => panic!("not a vector of vectors"),
+        }
+    }
+
+    fn valueset(&self, name: &str) -> String {
+        self.part(name).schema().metadata()["flatppl.valueset"].clone()
     }
 }
 
@@ -249,11 +265,15 @@ fn boxes_and_describe() {
     let server = start(None);
     assert_eq!(server.get("/v1/boxes").body, b"tb\n");
     let describe = server.get("/v1/boxes/tb/describe");
-    assert!(
-        String::from_utf8(describe.body)
-            .unwrap()
-            .contains("normal = record(kind = \"kernel\"")
+    assert_eq!(describe.content_type, "application/json");
+    let json = describe.json();
+    assert_eq!(json["normal"]["kind"], "kernel");
+    assert_eq!(
+        json["normal"]["input"],
+        "cartprod(mu = reals, sigma = posreals)"
     );
+    assert_eq!(json["stdnormal2"]["variate"], "cartpow(reals, 2)");
+    assert_eq!(json["square"]["queries"], serde_json::json!(["apply"]));
     assert_eq!(server.get("/v1/boxes/none/describe").status, 404);
 }
 
@@ -395,7 +415,10 @@ fn upload_on_missing_hash_then_retry() {
     );
     let r = server.query(&q, None, &[]);
     assert_eq!(r.status, 404);
-    assert_eq!(r.json().missing(), vec![format!("sha256:{hex}")]);
+    assert_eq!(
+        r.json()["missing"],
+        serde_json::json!([format!("sha256:{hex}")])
+    );
     assert_eq!(server.put(&"0".repeat(64), x.clone()), 400);
     assert_eq!(server.put(&hex, x.clone()), 201);
     assert_eq!(server.put(&hex, x), 200);
@@ -536,27 +559,234 @@ fn bearer_token() {
     assert_eq!(anonymous.status().as_u16(), 401);
 }
 
-/// Just enough JSON to read problem bodies.
-mod serde_json_lite {
-    pub struct Json(String);
+fn table(mu: Vec<f64>, sigma: Vec<f64>) -> Vec<u8> {
+    let rows = mu.len();
+    encode_part(&Value::Table(struct_array(
+        ["mu", "sigma"].into_iter(),
+        vec![
+            Arc::new(Float64Array::from(mu)) as ArrayRef,
+            Arc::new(Float64Array::from(sigma)) as ArrayRef,
+        ],
+        rows,
+    )))
+    .unwrap()
+}
 
-    pub fn parse(bytes: &[u8]) -> Json {
-        Json(String::from_utf8(bytes.to_vec()).unwrap())
+fn literal(state: &[i64]) -> String {
+    let bytes: Vec<String> = state.iter().map(ToString::to_string).collect();
+    format!("[{}]", bytes.join(", "))
+}
+
+#[test]
+fn batched_sampling_equals_unbatched_draws_per_row() {
+    let server = start(None);
+    let t = table(vec![0.0, 10.0, -5.0], vec![1.0, 0.1, 2.0]);
+    let head = format!(
+        "{HEAD}t = load_data(\"part:t\", cartpow(cartprod(mu = reals, sigma = posreals), 3))\n"
+    );
+    let batched = server.query(
+        &format!(
+            "{head}rngs = rnginit.([11, 12, 13])\nresult = broadcast(builtin_sample, rngs, tb.normal, t, 4)\n"
+        ),
+        None,
+        &[("t", t.clone())],
+    );
+    let value = batched.reals("value");
+    assert_eq!(batched.valueset("value"), "cartpow(reals, [3, 4])");
+    let states = batched.int_rows("rngstate");
+    assert_eq!(states.len(), 3);
+    let rows = [(11, 0.0, 1.0), (12, 10.0, 0.1), (13, -5.0, 2.0)];
+    let single = |rng: &str, mu: f64, sigma: f64| {
+        server.query(
+            &format!(
+                "{HEAD}result = builtin_sample({rng}, tb.normal, (mu = {mu:?}, sigma = {sigma:?}), 4)\n"
+            ),
+            None,
+            &[],
+        )
+    };
+    for (i, &(seed, mu, sigma)) in rows.iter().enumerate() {
+        let one = single(&format!("rnginit({seed})"), mu, sigma);
+        assert_eq!(one.reals("value"), value[i * 4..][..4]);
+        assert_eq!(one.int_rows("rngstate")[0], states[i]);
     }
 
-    impl Json {
-        pub fn missing(&self) -> Vec<String> {
-            let list = self
-                .0
-                .split("\"missing\":[")
-                .nth(1)
-                .unwrap()
-                .split(']')
-                .next()
-                .unwrap();
-            list.split(',')
-                .map(|s| s.trim_matches('"').to_owned())
-                .collect()
-        }
+    // Resume every row from the state the batched reply returned.
+    let len = states[0].len();
+    let s = encode_part(&Value::Array {
+        shape: vec![3],
+        data: nest(Arc::new(Int64Array::from(states.concat())), &[len]),
+    })
+    .unwrap();
+    let resumed = server.query(
+        &format!(
+            "{head}s = load_data(\"part:s\", cartpow(cartpow(integers, {len}), 3))\nresult = broadcast(builtin_sample, rngstate.(s), tb.normal, t, 4)\n"
+        ),
+        None,
+        &[("t", t), ("s", s)],
+    );
+    let value = resumed.reals("value");
+    for (i, &(_, mu, sigma)) in rows.iter().enumerate() {
+        let one = single(&format!("rngstate({})", literal(&states[i])), mu, sigma);
+        assert_eq!(one.reals("value"), value[i * 4..][..4]);
     }
+
+    // A measure member, and seeds given as byte vectors.
+    let batched = server.query(
+        &format!("{HEAD}result = broadcast(builtin_sample, rnginit.([[1, 2], [3, 4]]), tb.stdnormal, 3)\n"),
+        None,
+        &[],
+    );
+    let value = batched.reals("value");
+    assert_eq!(batched.valueset("value"), "cartpow(reals, [2, 3])");
+    for (i, seed) in ["[1, 2]", "[3, 4]"].into_iter().enumerate() {
+        let one = server.query(
+            &format!("{HEAD}result = builtin_sample(rnginit({seed}), tb.stdnormal, 3)\n"),
+            None,
+            &[],
+        );
+        assert_eq!(one.reals("value"), value[i * 3..][..3]);
+    }
+}
+
+#[test]
+fn batched_sampling_refuses_a_shared_rng_state() {
+    let server = start(None);
+    let t = table(vec![0.0, 1.0, 2.0], vec![1.0, 1.0, 1.0]);
+    let status = |q: &str| {
+        let q = format!(
+            "{HEAD}t = load_data(\"part:t\", cartpow(cartprod(mu = reals, sigma = posreals), 3))\n{q}"
+        );
+        server.query(&q, None, &[("t", t.clone())]).status
+    };
+    assert_eq!(
+        status("result = broadcast(builtin_sample, rnginit(1), tb.normal, t)\n"),
+        422
+    );
+    // A size-one array of states would expand to every row.
+    assert_eq!(
+        status("result = broadcast(builtin_sample, rnginit.([1]), tb.normal, t)\n"),
+        422
+    );
+    assert_eq!(
+        status("result = broadcast(builtin_sample, rnginit.([1, 2]), tb.normal, t)\n"),
+        400
+    );
+    assert_eq!(
+        status("result = builtin_sample(rnginit.([1, 2]), tb.stdnormal)\n"),
+        400
+    );
+    assert_eq!(
+        status("result = broadcast(builtin_sample, rnginit.([1, 2, 3]), tb.normal, t)\n"),
+        200
+    );
+}
+
+/// The standard normal log density of a 2-vector: norm.logpdf(a) + norm.logpdf(b).
+fn lognormal2(a: f64, b: f64) -> f64 {
+    const LN_2PI: f64 = 1.8378770664093453;
+    -0.5 * (a * a + b * b) - LN_2PI
+}
+
+#[test]
+fn a_batch_of_vectors_broadcasts_per_vector_and_a_matrix_per_scalar() {
+    let server = start(None);
+    let xs = vec![0.5, -1.0, 2.0, 0.0, 1.5, 3.0];
+    let expected: Vec<f64> = xs.chunks(2).map(|v| lognormal2(v[0], v[1])).collect();
+    let options = r#"{"derivative": {"kind": "gradient", "wrt": ["xs"]}}"#;
+    let vectors = format!(
+        "{HEAD}xs = load_data(\"part:xs\", cartpow(cartpow(reals, 2), 3))\nresult = builtin_logdensityof.(tb.stdnormal2, xs)\n"
+    );
+
+    // A FixedSizeList column.
+    let r = server.query(
+        &vectors,
+        Some(options),
+        &[("xs", reals(vec![3, 2], xs.clone()))],
+    );
+    assert_eq!(r.reals("value").len(), 3);
+    assert!(
+        r.reals("value")
+            .iter()
+            .zip(&expected)
+            .all(|(&a, &b)| close(a, b))
+    );
+    assert_eq!(r.reals("d_xs"), xs.iter().map(|x| -x).collect::<Vec<_>>());
+    assert_eq!(r.valueset("d_xs"), "cartpow(cartpow(reals, 2), 3)");
+
+    // A List column.
+    let field = Arc::new(Field::new("item", arrow_schema::DataType::Float64, false));
+    let list = ListArray::new(
+        field,
+        arrow_buffer::OffsetBuffer::from_lengths([2, 2, 2]),
+        Arc::new(Float64Array::from(xs.clone())),
+        None,
+    );
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "xs",
+        list.data_type().clone(),
+        false,
+    )]));
+    let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(list)]).unwrap();
+    let mut writer = arrow_ipc::writer::StreamWriter::try_new(Vec::new(), &schema).unwrap();
+    writer.write(&batch).unwrap();
+    let r = server.query(&vectors, None, &[("xs", writer.into_inner().unwrap())]);
+    assert!(
+        r.reals("value")
+            .iter()
+            .zip(&expected)
+            .all(|(&a, &b)| close(a, b))
+    );
+
+    // A literal array of vectors.
+    let r = server.query(
+        &format!(
+            "{HEAD}result = builtin_logdensityof.(tb.stdnormal2, [[0.5, -1.0], [2.0, 0.0]])\n"
+        ),
+        None,
+        &[],
+    );
+    assert!(
+        r.reals("value")
+            .iter()
+            .zip(&expected)
+            .all(|(&a, &b)| close(a, b))
+    );
+
+    // A matrix broadcasts to its scalars: six rows, none of them a 2-vector.
+    let matrix = |member: &str| {
+        let q = format!(
+            "{HEAD}xs = load_data(\"part:xs\", cartpow(reals, [3, 2]))\nresult = builtin_logdensityof.(tb.{member}, xs)\n"
+        );
+        server.query(&q, None, &[("xs", reals(vec![3, 2], xs.clone()))])
+    };
+    assert_eq!(matrix("stdnormal").reals("value").len(), 6);
+    assert_eq!(matrix("stdnormal2").status, 400);
+}
+
+#[test]
+fn the_core_checks_arguments_against_declared_sets() {
+    let server = start(None);
+    let query = |q: &str| server.query(&format!("{HEAD}{q}"), None, &[]);
+    // testbox would return NaN for a negative sigma: the core refuses first.
+    let r = query("result = builtin_logdensityof(tb.normal, (mu = 0.0, sigma = -1.0), 0.3)\n");
+    assert_eq!(r.status, 400);
+    assert!(r.json()["detail"].as_str().unwrap().contains("posreals"));
+    for q in [
+        "result = builtin_logdensityof(tb.normal, (mu = 0.0), 0.3)\n",
+        "result = builtin_logdensityof(tb.stdnormal, true)\n",
+        "result = builtin_logdensityof(tb.stdnormal2, [1.0, 2.0, 3.0])\n",
+        "result = builtin_logdensityof(tb.stdnormal2, [true, false])\n",
+        "result = builtin_sample(rnginit(1), tb.normal, (mu = 0.0, sigma = 0.0))\n",
+    ] {
+        assert_eq!(query(q).status, 400, "{q}");
+    }
+    let t = table(vec![0.0, 0.0], vec![1.0, -1.0]);
+    let q = format!(
+        "{HEAD}t = load_data(\"part:t\", cartpow(cartprod(mu = reals, sigma = reals), 2))\nresult = broadcast(builtin_logdensityof, tb.normal, t, 0.3)\n"
+    );
+    assert_eq!(server.query(&q, None, &[("t", t)]).status, 400);
+    // An integer is a real (spec §03).
+    let r = query("result = builtin_logdensityof(tb.stdnormal, 1)\n");
+    assert!(close(r.reals("value")[0], -1.4189385332046727));
 }
